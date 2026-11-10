@@ -569,6 +569,21 @@ async function run(options = {}) {
     const disc = await discResp.json().catch(() => ({}));
     if (disc?.signer?.public_key_b64url) {
       signingKeyObj = parseSpki(disc.signer.public_key_b64url);
+    } else if (disc?.signer?.public_key_base64) {
+      signingKeyObj = parseSpki(disc.signer.public_key_base64);
+    } else if (disc?.verification_url) {
+      const verResp = await fetchImpl(new URL(disc.verification_url, origin), {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        cache: 'no-store'
+      }).catch(() => null);
+      if (verResp && verResp.status === 200) {
+        const ver = await verResp.json().catch(() => ({}));
+        const pub =
+          ver?.authoritative_public_key?.public_key_base64 ||
+          ver?.authoritative_public_key?.public_key_b64url ||
+          ver?.authoritative_public_key?.legacy_public_key_b64url;
+        if (pub) signingKeyObj = parseSpki(pub);
+      }
     } else if (disc?.admission_url) {
       const admResp = await fetchImpl(new URL(disc.admission_url, origin), {
         headers: { 'User-Agent': 'Mozilla/5.0' },
@@ -661,8 +676,11 @@ async function run(options = {}) {
       }
     }
 
-    const outcome = envelope.payload.decision_record?.outcome;
-    const refHash = envelope.payload.decision_record_ref || createHash('sha256').update(bytes).digest('hex');
+    const outcome = envelope.payload.decision_record?.outcome || envelope.payload.outcome;
+    const refHash =
+      envelope.payload.mark_id ||
+      envelope.payload.decision_record_ref ||
+      createHash('sha256').update(bytes).digest('hex');
 
     if (outcome !== 'ESTABLISHED') {
       throw Error(`Standing outcome not established: ${outcome}`);
