@@ -47,7 +47,7 @@ Outputs preserve the evaluator's returned record, its hash, signature status, an
 ## Important boundaries
 
 - Payment never buys a favorable result.
-- A signed front-door evaluation is not a sealed Standing Mark.
+- The service has one door, POST /v1/evaluate, and it returns the signed Standing Mark record (WHP-STANDING-MARK-v1): a positive Mark or a signed negative finding.
 - A valid signature establishes record integrity under the discovered key, not the truth of the submitted claims or external authority.
 - A client-side workflow disposition is separate from the examination and does not mutate it.
 - A prior hash or continuity object supplied by a caller is not, by itself, proof of lineage.
