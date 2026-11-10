@@ -663,35 +663,64 @@ async function run(options = {}) {
     return { outcome, hash: record_hash, record, signature, signatureStatus, reception, report, continuity };
   }
 
-  // Format 2: Sealed WHP-STANDING-MARK-v2 / WHP-STANDING-RESULT-v2
+  // Format 2: Sealed WHP-STANDING-MARK-v2 / WHP-STANDING-RESULT-v2 / WHP-STANDING-MARK-v1
   if (data.protected && data.payload && data.signature) {
     const envelope = data;
     const kind = envelope.protected.type;
     const bytes = Buffer.from(canonical({ protected: envelope.protected, payload: envelope.payload }));
 
+    let signatureStatus = 'UNVERIFIED';
     if (signingKeyObj) {
       const sigBytes = Buffer.from(envelope.signature, 'base64');
       if (!verify(null, bytes, signingKeyObj, sigBytes)) {
         throw Error('Sealed Mark Ed25519 signature verification failed');
       }
+      signatureStatus = 'VERIFIED';
+    } else {
+      signatureStatus = 'KEY_UNRESOLVED';
     }
 
     const outcome = envelope.payload.decision_record?.outcome || envelope.payload.outcome;
+    const disposition =
+      envelope.payload.finding_disposition ||
+      (outcome === 'ESTABLISHED' ? 'POSITIVE_STANDING_MARK' : 'NEGATIVE_STANDING_FINDING');
     const refHash =
       envelope.payload.mark_id ||
       envelope.payload.decision_record_ref ||
       createHash('sha256').update(bytes).digest('hex');
 
-    if (outcome !== 'ESTABLISHED') {
-      throw Error(`Standing outcome not established: ${outcome}`);
+    const continued = outcome === 'ESTABLISHED';
+    const reception = makeReceptionEvent(refHash, outcome, continued, null);
+
+    const summary = [
+      `### WHP Standing Mark Result: \`${outcome}\``,
+      `- **Type:** \`${kind}\``,
+      `- **Mark ID / Hash:** \`${refHash}\``,
+      `- **Disposition:** \`${disposition}\``,
+      `- **Signature Status:** \`${signatureStatus}\``,
+      `- **Workflow Action:** \`${continued ? 'CONTINUED' : 'BLOCKED'}\``,
+    ].join('\n');
+
+    console.log(`STANDING_RESULT: ${kind} outcome=${outcome} disposition=${disposition} sig=${signatureStatus}`);
+    console.log(`RECORD_REF: ${refHash}`);
+    console.log(summary);
+
+    if (env.GITHUB_STEP_SUMMARY) {
+      fs.appendFileSync(env.GITHUB_STEP_SUMMARY, summary + '\n');
+    }
+    if (env.GITHUB_OUTPUT) {
+      fs.appendFileSync(
+        env.GITHUB_OUTPUT,
+        `outcome=${outcome}\nhash=${refHash}\nsignature_status=${signatureStatus}\nworkflow_disposition=${continued ? 'continued' : 'blocked'}\n`
+      );
+      appendMultilineOutput(env.GITHUB_OUTPUT, 'record_json', JSON.stringify(data, null, 2));
+      appendMultilineOutput(env.GITHUB_OUTPUT, 'reception_event_json', JSON.stringify(reception, null, 2));
     }
 
-    console.log(`STANDING_ESTABLISHED: ${kind} outcome=${outcome}`);
-    console.log(`RECORD_REF: ${refHash}`);
-    if (env.GITHUB_OUTPUT) {
-      fs.appendFileSync(env.GITHUB_OUTPUT, `outcome=${outcome}\nhash=${refHash}\n`);
+    if (!continued) {
+      throw Error(`Standing outcome not established: ${outcome} (${disposition})`);
     }
-    return { outcome, hash: refHash, mark: envelope };
+    return { outcome, hash: refHash, mark: envelope, signatureStatus, reception };
   }
 
   throw Error('Unrecognized response format: expected signed front-door record or sealed Standing Mark');
