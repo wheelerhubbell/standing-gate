@@ -2,11 +2,9 @@
 
 Standing Gate is the existing GitHub Action and CI client for Wheeler Hubbell Publishing's Decision Integrity services. It submits an examination, preserves the signed response, verifies the front-door record against the live issuer key, and records the workflow's separate reception decision.
 
-## Know which service door you are using
+## Service architecture and evaluation door
 
-The action defaults to `POST /v1/evaluate`. That is the ordinary-agent front door. Its signed `WHP-FRONTDOOR-EVALUATION-v1` record is not a sealed WHP Standing Mark, and a workflow's configured outcome allowlist is not evaluator authorization to deploy, merge, spend, or otherwise execute a consequential action.
-
-The sealed Standing purchase is a distinct route, `POST /v1/evaluations`, described by the live contract. It accepts the structured `WHP-STANDING-STRUCTURED-PASSAGE` submission and can issue a signed Mark or Assessment after its separate authority, quote-binding, payment-finality, and verification requirements are met. This action's default front-door call does not perform that sealed purchase.
+The service operates on a single evaluation door at `POST /v1/evaluate`. It emits an object-bound, Ed25519-signed `WHP-STANDING-MARK-v1` record (`POSITIVE_STANDING_MARK` with outcome `ESTABLISHED`, or `NEGATIVE_STANDING_FINDING` with outcome `NOT_ESTABLISHED`). A workflow's configured outcome allowlist controls client reception; it is not evaluator authorization to deploy, merge, spend, or otherwise execute a consequential action.
 
 Read the live contract before relying on request fields, price, authentication, payment, keys, or verification procedures:
 
@@ -17,9 +15,7 @@ Read the live contract before relying on request fields, price, authentication, 
 
 ## Authentication and payment
 
-For `/v1/evaluate`, provide an authorized WHP API key if one has been provisioned, or use the supported x402 payment flow. The live front-door challenge currently advertises 1 USDC on Base. A paid evaluation purchases an examination, not a favorable determination. Never put a wallet private key in a workflow file, repository, issue, or log; store authorized credentials only as GitHub Actions secrets and keep spending limits under the wallet owner's control.
-
-The sealed `/v1/evaluations` route uses its own exact-quote-bound purchase protocol. Do not assume that a generic x402 client, a front-door payment, or a direct wallet transfer is interchangeable with that protocol.
+Provide an authorized WHP API key if one has been provisioned, or use the supported x402 payment flow. The live front-door challenge currently advertises 1 USDC on Base (`eip155:8453`, asset `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913` to `0x1050eddd8282623b0c263ed6bdbd42370bbc28d3`). A paid evaluation purchases an examination, not a favorable determination. Never put a wallet private key in a workflow file, repository, issue, or log; store authorized credentials only as GitHub Actions secrets and keep spending limits under the wallet owner's control.
 
 ## CI workflow
 
