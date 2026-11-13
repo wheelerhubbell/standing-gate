@@ -1,3 +1,5 @@
+> Current integration: [developer onboarding](https://wheelerhubbellpublishing.com/developers.html) and [current SDKs](https://github.com/wheelerhubbell/standing-mark). This page describes a legacy integration. Host links have been corrected, but compatibility with the current payment and record contract is not established.
+
 # Standing Gate
 
 Standing Gate is the existing GitHub Action and CI client for Wheeler Hubbell Publishing's Decision Integrity services. It submits an examination, preserves the signed response, verifies the front-door record against the live issuer key, and records the workflow's separate reception decision.
@@ -8,10 +10,10 @@ The service operates on a single evaluation door at `POST /v1/evaluate`. It emit
 
 Read the live contract before relying on request fields, price, authentication, payment, keys, or verification procedures:
 
-- Contract: <https://api.wheelerhubbellpublishing.com/v1/contract>
-- Discovery: <https://api.wheelerhubbellpublishing.com/.well-known/whp-standing.json>
-- Front-door description: <https://api.wheelerhubbellpublishing.com/v1/evaluate>
-- Verification: <https://api.wheelerhubbellpublishing.com/v1/verification>
+- Contract: <https://decisionintegrity.wheelerhubbellpublishing.com/v1/contract>
+- Discovery: <https://decisionintegrity.wheelerhubbellpublishing.com/.well-known/whp-standing.json>
+- Front-door description: <https://decisionintegrity.wheelerhubbellpublishing.com/v1/evaluate>
+- Verification: <https://decisionintegrity.wheelerhubbellpublishing.com/v1/verification>
 
 ## Authentication and payment
 

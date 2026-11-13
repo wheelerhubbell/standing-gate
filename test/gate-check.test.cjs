@@ -56,7 +56,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
   await t.test('2. 402 Challenge Parsing & Validation', () => {
     const rawTerms = {
       x402Version: 2,
-      resource: { url: 'https://api.wheelerhubbellpublishing.com/v1/evaluate' },
+      resource: { url: 'https://decisionintegrity.wheelerhubbellpublishing.com/v1/evaluate' },
       accepts: [{
         scheme: 'exact',
         network: 'eip155:8453',
@@ -94,7 +94,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
     const payer = '0x2222222222222222222222222222222222222222';
     const terms = {
       x402Version: 2,
-      resource: { url: 'https://api.wheelerhubbellpublishing.com/v1/evaluate' },
+      resource: { url: 'https://decisionintegrity.wheelerhubbellpublishing.com/v1/evaluate' },
       accepts: [{
         scheme: 'exact',
         network: 'eip155:8453',
@@ -226,7 +226,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
         // Initial POST -> return 402 with challenge
         const terms = {
           x402Version: 2,
-          resource: { url: 'https://api.wheelerhubbellpublishing.com/v1/evaluate' },
+          resource: { url: 'https://decisionintegrity.wheelerhubbellpublishing.com/v1/evaluate' },
           accepts: [{
             scheme: 'exact',
             network: 'eip155:8453',
@@ -273,7 +273,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
 
     const result = await run({
       env: {
-        WHP_URL: 'https://api.wheelerhubbellpublishing.com',
+        WHP_URL: 'https://decisionintegrity.wheelerhubbellpublishing.com',
         WHP_DOOR: '/v1/evaluate'
       },
       proactive: false,
@@ -338,7 +338,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
 
     const res = await run({
       env: {
-        WHP_ORIGIN: 'https://api.wheelerhubbellpublishing.com',
+        WHP_ORIGIN: 'https://decisionintegrity.wheelerhubbellpublishing.com',
         WHP_DOOR: '/v1/evaluate'
       },
       signer: dummySigner,
@@ -400,7 +400,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
 
     const res = await run({
       env: {
-        WHP_URL: 'https://api.wheelerhubbellpublishing.com',
+        WHP_URL: 'https://decisionintegrity.wheelerhubbellpublishing.com',
         WHP_DOOR: '/v1/evaluate',
         WHP_API_KEY: 'whp_live_team_ci_cd_test_key_123',
         WHP_CLAIM: 'Subscription verification test'
@@ -423,7 +423,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
       json: async () => ({ error: 'Payment required' })
     });
     await assert.rejects(
-      () => run({ env: { WHP_URL: 'https://api.wheelerhubbellpublishing.com' }, fetchImpl: mockFetch402 }),
+      () => run({ env: { WHP_URL: 'https://decisionintegrity.wheelerhubbellpublishing.com' }, fetchImpl: mockFetch402 }),
       /Payment required \(402\)/
     );
 
@@ -456,7 +456,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
 
     await assert.rejects(
       () => run({
-        env: { WHP_URL: 'https://api.wheelerhubbellpublishing.com' },
+        env: { WHP_URL: 'https://decisionintegrity.wheelerhubbellpublishing.com' },
         signer: simulatedSigner,
         fetchImpl: mockFetchReject
       }),
@@ -493,7 +493,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
 
     await run({
       env: {
-        WHP_URL: "https://api.wheelerhubbellpublishing.com",
+        WHP_URL: "https://decisionintegrity.wheelerhubbellpublishing.com",
         WHP_API_KEY: "test_key",
         WHP_PROVENANCE: "https://github.com/wheelerhubbell/standing-gate/commit/abcdef"
       },
@@ -505,7 +505,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
     const customProv = { source: "custom-pipeline", authority: "signer-cert", evidence: [] };
     await run({
       env: {
-        WHP_URL: "https://api.wheelerhubbellpublishing.com",
+        WHP_URL: "https://decisionintegrity.wheelerhubbellpublishing.com",
         WHP_API_KEY: "test_key",
         WHP_PROVENANCE: JSON.stringify(customProv)
       },
@@ -541,7 +541,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
       }) };
     };
     const res = await run({
-      env: { WHP_URL: 'https://api.wheelerhubbellpublishing.com', WHP_API_KEY: 'test', WHP_PROACTIVE: 'false' },
+      env: { WHP_URL: 'https://decisionintegrity.wheelerhubbellpublishing.com', WHP_API_KEY: 'test', WHP_PROACTIVE: 'false' },
       input, fetchImpl: mockFetch
     });
     assert.deepEqual(posted, input);
@@ -593,7 +593,7 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
 
     const res = await run({
       env: {
-        WHP_URL: 'https://api.wheelerhubbellpublishing.com',
+        WHP_URL: 'https://decisionintegrity.wheelerhubbellpublishing.com',
         WHP_API_KEY: 'test',
         WHP_PROACTIVE: 'false',
         WHP_PRIOR_RECORD_HASH: priorHash,

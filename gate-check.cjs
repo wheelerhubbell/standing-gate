@@ -323,7 +323,7 @@ function formatAdjudicationReport(record, signature, recordHash, signatureStatus
     `- Signature algorithm: \`${signature?.alg || 'not supplied'}\``,
     `- Signature public key: \`${signature?.public_key_b64url || 'not supplied'}\``,
     `- Signature check: **${signatureStatus}**`,
-    '- Verification endpoint: https://api.wheelerhubbellpublishing.com/v1/verification',
+    '- Verification endpoint: https://decisionintegrity.wheelerhubbellpublishing.com/v1/verification',
     '',
     '### Client reception (separate from the examination)',
     `- Workflow disposition: **${disposition}**`,
@@ -357,7 +357,7 @@ async function run(options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   const customSigner = options.signer || null;
 
-  const origin = new URL(env.WHP_URL || 'https://api.wheelerhubbellpublishing.com');
+  const origin = new URL(env.WHP_URL || 'https://decisionintegrity.wheelerhubbellpublishing.com');
   if (origin.protocol !== 'https:' && origin.hostname !== 'localhost' && origin.hostname !== '127.0.0.1') {
     throw Error('HTTPS service required');
   }
