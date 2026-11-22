@@ -1,4 +1,4 @@
-const { createHash, createPublicKey, randomBytes, verify } = require('node:crypto');
+const { createHash, createPublicKey, randomBytes, verify: cryptoVerify } = require('node:crypto');
 const fs = require('node:fs');
 
 function canonical(v) {
@@ -617,7 +617,7 @@ async function run(options = {}) {
       throw Error('Record signer does not match the live /v1/evaluate issuer key');
     }
     const sigBytes = decodeB64Url(signature.value_b64url, 64);
-    if (!verify(null, bytes, signingKeyObj, sigBytes)) {
+    if (!cryptoVerify(null, bytes, signingKeyObj, sigBytes)) {
       throw Error('Ed25519 signature verification failed');
     }
     const signatureStatus = 'VERIFIED_AGAINST_LIVE_DISCOVERY_KEY';
@@ -672,7 +672,7 @@ async function run(options = {}) {
     let signatureStatus = 'UNVERIFIED';
     if (signingKeyObj) {
       const sigBytes = Buffer.from(envelope.signature, 'base64');
-      if (!verify(null, bytes, signingKeyObj, sigBytes)) {
+      if (!cryptoVerify(null, bytes, signingKeyObj, sigBytes)) {
         throw Error('Sealed Mark Ed25519 signature verification failed');
       }
       signatureStatus = 'VERIFIED';
@@ -726,11 +726,448 @@ async function run(options = {}) {
   throw Error('Unrecognized response format: expected signed front-door record or sealed Standing Mark');
 }
 
+
+const CANONICAL_ISSUER_KEYS = [
+  'MCowBQYDK2VwAyEAcpFVUj6xDgsUsKJK2r2rLk6R+te2lghdHE8jvjl9SBk=', // Current live PHP service
+  'MCowBQYDK2VwAyEABE1ix0WObYNYEsVQm36qIjzqajWCilAwZxbpo3aKCPY='  // Authoritative published key
+];
+
+function resolveKeyObj(rawInput) {
+  if (!rawInput) return null;
+  if (typeof rawInput === 'object' && rawInput.type === 'public') return rawInput;
+  if (typeof rawInput === 'string') {
+    const trimmed = rawInput.trim();
+    if (trimmed.startsWith('-----BEGIN')) {
+      try { return createPublicKey(trimmed); } catch (e) { return null; }
+    }
+    try { return parseSpki(trimmed); } catch (e) { return null; }
+  }
+  return null;
+}
+
+function verify(request, mark, options = {}) {
+  // 1. Missing, unreadable, or invalid input fails closed
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    return {
+      allow: false,
+      reason_code: 'MISSING_OR_INVALID_REQUEST',
+      message: 'Request must be a non-null object specifying the intended action'
+    };
+  }
+
+  if (mark == null) {
+    return {
+      allow: false,
+      reason_code: 'MISSING_MARK',
+      message: 'Standing Mark is required'
+    };
+  }
+
+  let envelope = mark;
+  if (typeof envelope === 'string') {
+    try {
+      envelope = JSON.parse(envelope.trim());
+    } catch (err) {
+      return {
+        allow: false,
+        reason_code: 'UNREADABLE_MARK',
+        message: 'Standing Mark is not valid JSON'
+      };
+    }
+  }
+
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    return {
+      allow: false,
+      reason_code: 'UNREADABLE_MARK',
+      message: 'Standing Mark must be an object'
+    };
+  }
+
+  // 2. Identify envelope format
+  // Format A: Sealed envelope { protected, payload, signature }
+  // Format B: Frontdoor evaluation { record, signature, record_hash }
+  const isFormatA = !!(envelope.protected && envelope.payload && envelope.signature);
+  const isFormatB = !!(envelope.record && envelope.signature);
+
+  if (!isFormatA && !isFormatB) {
+    return {
+      allow: false,
+      reason_code: 'UNRECOGNIZED_MARK_FORMAT',
+      message: 'Mark format not recognized: expected sealed envelope or frontdoor evaluation'
+    };
+  }
+
+  // Determine trusted public keys
+  const trustedKeys = [];
+  if (options.issuerKey) {
+    const k = resolveKeyObj(options.issuerKey);
+    if (k) trustedKeys.push(k);
+  }
+  if (Array.isArray(options.trustedKeys)) {
+    for (const t of options.trustedKeys) {
+      const k = resolveKeyObj(t);
+      if (k) trustedKeys.push(k);
+    }
+  }
+  if (trustedKeys.length === 0) {
+    for (const c of CANONICAL_ISSUER_KEYS) {
+      const k = resolveKeyObj(c);
+      if (k) trustedKeys.push(k);
+    }
+  }
+
+  let payload = null;
+  let outcome = null;
+  let markId = null;
+  let bounds = null;
+  let objectBinding = null;
+  let proposition = null;
+  let sigVerified = false;
+
+  if (isFormatA) {
+    payload = envelope.payload;
+    if (!payload || typeof payload !== 'object') {
+      return { allow: false, reason_code: 'UNREADABLE_MARK', message: 'Malformed payload in sealed Mark' };
+    }
+
+    const bytes = Buffer.from(canonical({ protected: envelope.protected, payload: envelope.payload }));
+    let sigBytes;
+    try {
+      const sigStr = String(envelope.signature);
+      sigBytes = /^[A-Za-z0-9_-]+$/.test(sigStr) && !sigStr.includes('+') && !sigStr.includes('/')
+        ? Buffer.from(sigStr, 'base64url')
+        : Buffer.from(sigStr, 'base64');
+    } catch (e) {
+      return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Unable to decode signature bytes' };
+    }
+
+    for (const keyObj of trustedKeys) {
+      try {
+        if (cryptoVerify(null, bytes, keyObj, sigBytes)) {
+          sigVerified = true;
+          break;
+        }
+      } catch (e) {}
+    }
+
+    if (!sigVerified) {
+      return {
+        allow: false,
+        reason_code: 'INVALID_SIGNATURE',
+        message: 'Signature verification failed against trusted WHP issuer key'
+      };
+    }
+
+    outcome = payload.decision_record?.outcome || payload.outcome;
+    markId = payload.mark_id || payload.decision_record_ref || createHash('sha256').update(bytes).digest('hex');
+    bounds = payload.bounds || { valid_from: payload.issued_at, valid_until: payload.expires_at };
+    objectBinding = payload.object_binding || payload.decision_record?.object_binding || {};
+    proposition = payload.decision_record?.proposition || payload.claim || objectBinding.claim;
+  } else if (isFormatB) {
+    const record = envelope.record;
+    if (!record || typeof record !== 'object') {
+      return { allow: false, reason_code: 'UNREADABLE_MARK', message: 'Malformed record in frontdoor Mark' };
+    }
+
+    const bytes = Buffer.from(canonical(record));
+    const computedHash = createHash('sha256').update(bytes).digest('hex');
+
+    if (envelope.record_hash && envelope.record_hash !== computedHash) {
+      return {
+        allow: false,
+        reason_code: 'TAMPERED_RECORD',
+        message: 'Record hash mismatch: canonical bytes do not match record_hash'
+      };
+    }
+
+    const sigObj = envelope.signature;
+    if (!sigObj || typeof sigObj !== 'object') {
+      return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Missing signature object' };
+    }
+
+    let sigBytes;
+    try {
+      if (sigObj.value_b64url) {
+        sigBytes = decodeB64Url(sigObj.value_b64url, 64);
+      } else if (sigObj.value_base64 || sigObj.value) {
+        sigBytes = Buffer.from(sigObj.value_base64 || sigObj.value, 'base64');
+      } else {
+        return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Missing signature value' };
+      }
+    } catch (e) {
+      return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Invalid signature encoding: ' + e.message };
+    }
+
+    let signerKeyObj = null;
+    const pubKeyInput = sigObj.public_key_b64url || sigObj.public_key_base64 || sigObj.public_key;
+    if (pubKeyInput) {
+      signerKeyObj = resolveKeyObj(pubKeyInput);
+    }
+
+    let keyAuthorized = false;
+    if (signerKeyObj) {
+      const embeddedRaw = signerKeyObj.export({ format: 'der', type: 'spki' }).subarray(-32);
+      for (const trusted of trustedKeys) {
+        const trustedRaw = trusted.export({ format: 'der', type: 'spki' }).subarray(-32);
+        if (embeddedRaw.equals(trustedRaw)) {
+          keyAuthorized = true;
+          break;
+        }
+      }
+    } else {
+      for (const trusted of trustedKeys) {
+        try {
+          if (cryptoVerify(null, bytes, trusted, sigBytes)) {
+            sigVerified = true;
+            keyAuthorized = true;
+            break;
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (!keyAuthorized && !sigVerified) {
+      return {
+        allow: false,
+        reason_code: 'UNAUTHORIZED_KEY',
+        message: 'Signer key is not an authorized WHP issuer key'
+      };
+    }
+
+    if (!sigVerified) {
+      if (!cryptoVerify(null, bytes, signerKeyObj, sigBytes)) {
+        return {
+          allow: false,
+          reason_code: 'INVALID_SIGNATURE',
+          message: 'Ed25519 signature verification failed'
+        };
+      }
+      sigVerified = true;
+    }
+
+    outcome = record.determination?.outcome || record.outcome;
+    markId = envelope.record_hash || computedHash;
+    bounds = record.bounds || { valid_from: record.timestamp, valid_until: null };
+    objectBinding = record.object_binding || record.input || {};
+    proposition = record.input?.claim || record.input?.proposition || objectBinding.claim;
+  }
+
+  // 3. Outcome check: must be ESTABLISHED
+  if (outcome !== 'ESTABLISHED') {
+    return {
+      allow: false,
+      reason_code: 'OUTCOME_NOT_ESTABLISHED',
+      message: `Standing outcome is ${outcome || 'UNSPECIFIED'}; required ESTABLISHED`
+    };
+  }
+
+  // 4. Temporal check: Mark must be current
+  const nowMs = typeof options.now === 'number'
+    ? options.now
+    : (options.now instanceof Date ? options.now.getTime() : Date.now());
+  const toleranceMs = (options.clockToleranceSeconds || 60) * 1000;
+
+  if (bounds) {
+    if (bounds.valid_until) {
+      const untilMs = Date.parse(bounds.valid_until);
+      if (!isNaN(untilMs) && nowMs > (untilMs + toleranceMs)) {
+        return {
+          allow: false,
+          reason_code: 'MARK_EXPIRED',
+          message: `Standing Mark expired at ${bounds.valid_until}`
+        };
+      }
+    }
+    if (bounds.valid_from) {
+      const fromMs = Date.parse(bounds.valid_from);
+      if (!isNaN(fromMs) && nowMs < (fromMs - toleranceMs)) {
+        return {
+          allow: false,
+          reason_code: 'MARK_NOT_YET_VALID',
+          message: `Standing Mark not valid until ${bounds.valid_from}`
+        };
+      }
+    }
+  }
+
+  if (options.maxAgeSeconds && bounds?.valid_from) {
+    const fromMs = Date.parse(bounds.valid_from);
+    if (!isNaN(fromMs) && (nowMs - fromMs) > (options.maxAgeSeconds * 1000 + toleranceMs)) {
+      return {
+        allow: false,
+        reason_code: 'MARK_EXPIRED',
+        message: `Standing Mark exceeded maximum allowable age of ${options.maxAgeSeconds}s`
+      };
+    }
+  }
+
+  // 5. Bound object check: Mark must match this exact action
+  const reqOp = (request.operation || request.action || request.requested_operation || '').trim();
+  const markOp = (
+    objectBinding.requested_operation ||
+    objectBinding.operation ||
+    objectBinding.action ||
+    ''
+  ).trim();
+
+  if (reqOp && markOp && reqOp.toUpperCase() !== markOp.toUpperCase()) {
+    return {
+      allow: false,
+      reason_code: 'OPERATION_MISMATCH',
+      message: `Operation mismatch: request requested ${reqOp}, Mark was bound to ${markOp}`
+    };
+  }
+
+  const reqTarget = (
+    request.target ||
+    request.subject ||
+    request.object_id ||
+    (request.object && (request.object.id || request.object.target)) ||
+    ''
+  ).toString().trim();
+
+  const markTarget = (
+    objectBinding.object_id ||
+    objectBinding.subject ||
+    objectBinding.target ||
+    (objectBinding.object && (objectBinding.object.id || objectBinding.object.target)) ||
+    ''
+  ).toString().trim();
+
+  if (reqTarget && markTarget && reqTarget !== markTarget) {
+    return {
+      allow: false,
+      reason_code: 'OBJECT_MISMATCH',
+      message: `Object mismatch: request target is ${reqTarget}, Mark is bound to ${markTarget}`
+    };
+  }
+
+  const reqClaim = (
+    request.claim ||
+    request.proposition ||
+    request.statement ||
+    request.text ||
+    ''
+  ).toString().trim();
+
+  const markClaim = (
+    proposition ||
+    objectBinding.claim ||
+    objectBinding.proposition ||
+    ''
+  ).toString().trim();
+
+  if (reqClaim && markClaim && reqClaim !== markClaim) {
+    return {
+      allow: false,
+      reason_code: 'PROPOSITION_MISMATCH',
+      message: 'Proposition mismatch: request claim does not match Mark proposition'
+    };
+  }
+
+  if ((reqTarget || reqClaim) && !markTarget && !markClaim) {
+    return {
+      allow: false,
+      reason_code: 'UNBOUND_ACTION',
+      message: 'Mark has no object, target, or proposition binding matching the request'
+    };
+  }
+
+  return {
+    allow: true,
+    reason_code: 'ALLOW',
+    message: 'Standing Mark verified and bound to requested action',
+    mark_id: markId,
+    outcome: 'ESTABLISHED',
+    bound_object: {
+      operation: markOp || reqOp || 'INFORM',
+      target: markTarget || reqTarget || null,
+      claim: markClaim || reqClaim || null
+    }
+  };
+}
+
+function createStandingMiddleware(options = {}) {
+  return function standingMiddleware(req, res, next) {
+    const markHeader = req.headers['x-whp-standing-mark'] || req.headers['x-standing-mark'];
+    let mark = markHeader;
+    if (!mark && req.body && req.body._standing_mark) {
+      mark = req.body._standing_mark;
+    }
+
+    const requestDesc = options.extractRequest ? options.extractRequest(req) : {
+      operation: req.method,
+      target: req.originalUrl || req.url,
+      claim: req.headers['x-whp-claim'] || (req.body && req.body.claim)
+    };
+
+    const result = verify(requestDesc, mark, options);
+
+    if (!result.allow) {
+      if (typeof options.onDeny === 'function') {
+        return options.onDeny(result, req, res, next);
+      }
+      res.statusCode = 403;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify({
+        error: 'STANDING_DENIED',
+        reason_code: result.reason_code,
+        message: result.message
+      }));
+    }
+
+    req.standing = result;
+    if (typeof next === 'function') next();
+  };
+}
+
+function cliVerify(argv = process.argv.slice(3)) {
+  let reqArg = null;
+  let markArg = null;
+  let keyArg = null;
+
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--request' || argv[i] === '-r') {
+      reqArg = argv[++i];
+    } else if (argv[i] === '--mark' || argv[i] === '-m') {
+      markArg = argv[++i];
+    } else if (argv[i] === '--key' || argv[i] === '-k') {
+      keyArg = argv[++i];
+    }
+  }
+
+  function readInput(val) {
+    if (!val) return null;
+    const trimmed = val.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try { return JSON.parse(trimmed); } catch (e) { return null; }
+    }
+    if (fs.existsSync(trimmed)) {
+      try { return JSON.parse(fs.readFileSync(trimmed, 'utf8')); } catch (e) { return null; }
+    }
+    return trimmed;
+  }
+
+  const reqObj = readInput(reqArg);
+  const markObj = readInput(markArg);
+  const options = {};
+  if (keyArg) options.issuerKey = keyArg;
+
+  const result = verify(reqObj, markObj, options);
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(result.allow ? 0 : 1);
+}
+
 if (require.main === module) {
-  run().catch(err => {
-    console.error('BLOCKED:', err.message);
-    process.exitCode = 1;
-  });
+  if (process.argv[2] === 'verify') {
+    cliVerify(process.argv.slice(3));
+  } else {
+    run().catch(err => {
+      console.error('BLOCKED:', err.message);
+      process.exitCode = 1;
+    });
+  }
 }
 
 module.exports = {
@@ -747,5 +1184,9 @@ module.exports = {
   parseStructuredInput,
   formatAdjudicationReport,
   makeReceptionEvent,
-  run
+  run,
+  verify,
+  createStandingMiddleware,
+  cliVerify
 };
+

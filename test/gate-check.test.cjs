@@ -12,7 +12,10 @@ const {
   formatPaymentSignatureHeader,
   resolveCredential,
   signTypedDataPayload,
-  run
+  run,
+  verify,
+  createStandingMiddleware,
+  cliVerify
 } = require('../gate-check.cjs');
 
 test('x402 standing-gate unit & regression test suite', async (t) => {
@@ -611,5 +614,232 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
     assert.match(res.report, /### Successive examination and continuity/);
     assert.match(res.report, /SUCCESSIVE_LINEAGE_ESTABLISHED/);
     assert.match(res.report, /Additional Audit Clearance #2026-B/);
+  });
+});
+
+
+test('Receiving Boundary Rule No. 001: verify(request, mark) adversarial suite', async (t) => {
+  const { privateKey: edPriv, publicKey: edPub } = crypto.generateKeyPairSync('ed25519');
+  const edPubDer = edPub.export({ format: 'der', type: 'spki' });
+  const edPubRaw = edPubDer.subarray(edPubDer.length - 32);
+  const edPubB64Url = edPubRaw.toString('base64url');
+
+  const nowMs = Date.now();
+  const validFrom = new Date(nowMs - 60000).toISOString();
+  const validUntil = new Date(nowMs + 3600000).toISOString();
+
+  function createSignedMark(overrides = {}) {
+    const payload = {
+      type: 'WHP-STANDING-MARK-v1',
+      outcome: overrides.outcome || 'ESTABLISHED',
+      mark_id: overrides.mark_id || 'mark-test-123',
+      bounds: {
+        valid_from: overrides.valid_from !== undefined ? overrides.valid_from : validFrom,
+        valid_until: overrides.valid_until !== undefined ? overrides.valid_until : validUntil
+      },
+      object_binding: {
+        requested_operation: overrides.operation || 'DEPLOY',
+        object_id: overrides.target || 'wheelerhubbell/service-a@v1.0.0',
+        claim: overrides.claim || 'Authorized production deploy'
+      },
+      decision_record: {
+        outcome: overrides.outcome || 'ESTABLISHED',
+        proposition: overrides.claim || 'Authorized production deploy',
+        operation: overrides.operation || 'DEPLOY'
+      }
+    };
+
+    const protectedHdr = {
+      type: 'WHP-STANDING-MARK-v1',
+      alg: 'Ed25519',
+      key_id: 'key-test-123'
+    };
+
+    const bytes = Buffer.from(canonical({ protected: protectedHdr, payload }));
+    const sigBytes = crypto.sign(null, bytes, overrides.signingKey || edPriv);
+    const signature = sigBytes.toString('base64');
+
+    return {
+      protected: protectedHdr,
+      payload: overrides.tamperPayload ? { ...payload, ...overrides.tamperPayload } : payload,
+      signature: overrides.tamperSignature ? 'tamperedSignature==' : signature
+    };
+  }
+
+  const validMark = createSignedMark();
+  const validRequest = {
+    operation: 'DEPLOY',
+    target: 'wheelerhubbell/service-a@v1.0.0',
+    claim: 'Authorized production deploy'
+  };
+  const opts = { trustedKeys: [edPub] };
+
+  await t.test('1. Valid Mark and matching request returns allow: true with reason_code: ALLOW', () => {
+    const res = verify(validRequest, validMark, opts);
+    assert.equal(res.allow, true);
+    assert.equal(res.reason_code, 'ALLOW');
+    assert.equal(res.outcome, 'ESTABLISHED');
+    assert.ok(res.mark_id);
+  });
+
+  await t.test('2. Missing or unreadable inputs fail closed with deny', () => {
+    const r1 = verify(null, validMark, opts);
+    assert.equal(r1.allow, false);
+    assert.equal(r1.reason_code, 'MISSING_OR_INVALID_REQUEST');
+
+    const r2 = verify(validRequest, null, opts);
+    assert.equal(r2.allow, false);
+    assert.equal(r2.reason_code, 'MISSING_MARK');
+
+    const r3 = verify(validRequest, 'not-valid-json', opts);
+    assert.equal(r3.allow, false);
+    assert.equal(r3.reason_code, 'UNREADABLE_MARK');
+
+    const r4 = verify(validRequest, {}, opts);
+    assert.equal(r4.allow, false);
+    assert.equal(r4.reason_code, 'UNRECOGNIZED_MARK_FORMAT');
+  });
+
+  await t.test('3. Tampered payload or signature fails with INVALID_SIGNATURE', () => {
+    const tampered = createSignedMark({
+      tamperPayload: {
+        object_binding: {
+          requested_operation: 'UNAUTHORIZED_WIPE',
+          object_id: 'production-database'
+        }
+      }
+    });
+    const res = verify(validRequest, tampered, opts);
+    assert.equal(res.allow, false);
+    assert.equal(res.reason_code, 'INVALID_SIGNATURE');
+  });
+
+  await t.test('4. Replayed Mark against different object or operation fails with MISMATCH', () => {
+    // Replay against different target object
+    const replayedObjectReq = {
+      operation: 'DEPLOY',
+      target: 'wheelerhubbell/different-service@v2.0.0',
+      claim: 'Authorized production deploy'
+    };
+    const resObj = verify(replayedObjectReq, validMark, opts);
+    assert.equal(resObj.allow, false);
+    assert.equal(resObj.reason_code, 'OBJECT_MISMATCH');
+
+    // Replay against different operation
+    const replayedOpReq = {
+      operation: 'DESTROY',
+      target: 'wheelerhubbell/service-a@v1.0.0',
+      claim: 'Authorized production deploy'
+    };
+    const resOp = verify(replayedOpReq, validMark, opts);
+    assert.equal(resOp.allow, false);
+    assert.equal(resOp.reason_code, 'OPERATION_MISMATCH');
+
+    // Replay against different claim/proposition
+    const replayedClaimReq = {
+      operation: 'DEPLOY',
+      target: 'wheelerhubbell/service-a@v1.0.0',
+      claim: 'Completely different claim'
+    };
+    const resClaim = verify(replayedClaimReq, validMark, opts);
+    assert.equal(resClaim.allow, false);
+    assert.equal(resClaim.reason_code, 'PROPOSITION_MISMATCH');
+  });
+
+  await t.test('5. Expired Mark fails with MARK_EXPIRED', () => {
+    const expiredMark = createSignedMark({
+      valid_from: new Date(nowMs - 7200000).toISOString(),
+      valid_until: new Date(nowMs - 3600000).toISOString()
+    });
+    const res = verify(validRequest, expiredMark, { ...opts, clockToleranceSeconds: 0 });
+    assert.equal(res.allow, false);
+    assert.equal(res.reason_code, 'MARK_EXPIRED');
+  });
+
+  await t.test('6. Non-established outcome fails with OUTCOME_NOT_ESTABLISHED', () => {
+    const negativeMark = createSignedMark({
+      outcome: 'NOT_ESTABLISHED'
+    });
+    const res = verify(validRequest, negativeMark, opts);
+    assert.equal(res.allow, false);
+    assert.equal(res.reason_code, 'OUTCOME_NOT_ESTABLISHED');
+  });
+
+  await t.test('7. Frontdoor format B (WHP-FRONTDOOR-EVALUATION-v1) verified and detects hash tampering', () => {
+    const record = {
+      type: 'WHP-FRONTDOOR-EVALUATION-v1',
+      input: {
+        subject: 'service-b',
+        claim: 'Release check B',
+        requested_operation: 'RELEASE'
+      },
+      determination: { outcome: 'ESTABLISHED' },
+      bounds: {
+        valid_from: new Date(Date.now() - 1000).toISOString(),
+        valid_until: new Date(Date.now() + 100000).toISOString()
+      }
+    };
+    const bytes = Buffer.from(canonical(record));
+    const record_hash = crypto.createHash('sha256').update(bytes).digest('hex');
+    const sigBytes = crypto.sign(null, bytes, edPriv);
+
+    const frontdoorMark = {
+      record,
+      record_hash,
+      signature: {
+        alg: 'Ed25519',
+        public_key_b64url: edPubB64Url,
+        value_b64url: sigBytes.toString('base64url')
+      }
+    };
+
+    const req = { target: 'service-b', operation: 'RELEASE', claim: 'Release check B' };
+    const res = verify(req, frontdoorMark, { trustedKeys: [edPub] });
+    assert.equal(res.allow, true);
+    assert.equal(res.reason_code, 'ALLOW');
+
+    // Tamper record
+    const tamperedFrontdoor = {
+      ...frontdoorMark,
+      record: { ...record, determination: { outcome: 'ESTABLISHED', injected: true } }
+    };
+    const resTampered = verify(req, tamperedFrontdoor, { trustedKeys: [edPub] });
+    assert.equal(resTampered.allow, false);
+    assert.equal(resTampered.reason_code, 'TAMPERED_RECORD');
+  });
+
+  await t.test('8. HTTP Middleware wrapper returns 403 on deny, calls next() on allow', () => {
+    const middleware = createStandingMiddleware(opts);
+
+    // Deny case
+    let statusCode = null;
+    let responseBody = null;
+    let nextCalled = false;
+    const reqDeny = { headers: {}, method: 'POST', url: '/v1/execute' };
+    const resDeny = {
+      setHeader: () => {},
+      end: (b) => { responseBody = JSON.parse(b); }
+    };
+    Object.defineProperty(resDeny, 'statusCode', { set: (v) => { statusCode = v; } });
+
+    middleware(reqDeny, resDeny, () => { nextCalled = true; });
+    assert.equal(statusCode, 403);
+    assert.equal(responseBody.error, 'STANDING_DENIED');
+    assert.equal(responseBody.reason_code, 'MISSING_MARK');
+    assert.equal(nextCalled, false);
+
+    // Allow case
+    let allowNextCalled = false;
+    const reqAllow = {
+      headers: {
+        'x-whp-standing-mark': JSON.stringify(validMark),
+        'x-whp-claim': 'Authorized production deploy'
+      },
+      method: 'DEPLOY',
+      url: 'wheelerhubbell/service-a@v1.0.0'
+    };
+    middleware(reqAllow, {}, () => { allowNextCalled = true; });
+    assert.equal(allowNextCalled, true);
+    assert.equal(reqAllow.standing.allow, true);
   });
 });
