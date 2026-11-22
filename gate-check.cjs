@@ -727,17 +727,20 @@ async function run(options = {}) {
 }
 
 
-const CANONICAL_ISSUER_KEYS = [
-  'MCowBQYDK2VwAyEAcpFVUj6xDgsUsKJK2r2rLk6R+te2lghdHE8jvjl9SBk=', // Current live PHP service
-  'MCowBQYDK2VwAyEABE1ix0WObYNYEsVQm36qIjzqajWCilAwZxbpo3aKCPY='  // Authoritative published key
+// Authoritative WHP Signer Keys.
+// The receiving boundary ONLY accepts signatures from WHP authoritative issuer keys.
+// Requesting workflows and callers cannot substitute or supply their own issuer keys.
+const AUTHORITATIVE_ISSUER_KEYS = [
+  "MCowBQYDK2VwAyEABE1ix0WObYNYEsVQm36qIjzqajWCilAwZxbpo3aKCPY=", // Authoritative published key (key_id: baabb9cd21f367bb8467f1bce570cd1f4ef1b418172f2cb68968ebe7186f487e)
+  "MCowBQYDK2VwAyEAcpFVUj6xDgsUsKJK2r2rLk6R+te2lghdHE8jvjl9SBk="  // Live PHP service key
 ];
 
 function resolveKeyObj(rawInput) {
   if (!rawInput) return null;
-  if (typeof rawInput === 'object' && rawInput.type === 'public') return rawInput;
-  if (typeof rawInput === 'string') {
+  if (typeof rawInput === "object" && rawInput.type === "public") return rawInput;
+  if (typeof rawInput === "string") {
     const trimmed = rawInput.trim();
-    if (trimmed.startsWith('-----BEGIN')) {
+    if (trimmed.startsWith("-----BEGIN")) {
       try { return createPublicKey(trimmed); } catch (e) { return null; }
     }
     try { return parseSpki(trimmed); } catch (e) { return null; }
@@ -747,40 +750,40 @@ function resolveKeyObj(rawInput) {
 
 function verify(request, mark, options = {}) {
   // 1. Missing, unreadable, or invalid input fails closed
-  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
     return {
       allow: false,
-      reason_code: 'MISSING_OR_INVALID_REQUEST',
-      message: 'Request must be a non-null object specifying the intended action'
+      reason_code: "MISSING_OR_INVALID_REQUEST",
+      message: "Request must be a non-null object specifying the intended action"
     };
   }
 
   if (mark == null) {
     return {
       allow: false,
-      reason_code: 'MISSING_MARK',
-      message: 'Standing Mark is required'
+      reason_code: "MISSING_MARK",
+      message: "Standing Mark is required"
     };
   }
 
   let envelope = mark;
-  if (typeof envelope === 'string') {
+  if (typeof envelope === "string") {
     try {
       envelope = JSON.parse(envelope.trim());
     } catch (err) {
       return {
         allow: false,
-        reason_code: 'UNREADABLE_MARK',
-        message: 'Standing Mark is not valid JSON'
+        reason_code: "UNREADABLE_MARK",
+        message: "Standing Mark is not valid JSON"
       };
     }
   }
 
-  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
     return {
       allow: false,
-      reason_code: 'UNREADABLE_MARK',
-      message: 'Standing Mark must be an object'
+      reason_code: "UNREADABLE_MARK",
+      message: "Standing Mark must be an object"
     };
   }
 
@@ -793,31 +796,28 @@ function verify(request, mark, options = {}) {
   if (!isFormatA && !isFormatB) {
     return {
       allow: false,
-      reason_code: 'UNRECOGNIZED_MARK_FORMAT',
-      message: 'Mark format not recognized: expected sealed envelope or frontdoor evaluation'
+      reason_code: "UNRECOGNIZED_MARK_FORMAT",
+      message: "Mark format not recognized: expected sealed envelope or frontdoor evaluation"
     };
   }
 
-  // Determine trusted public keys
+  // 3. Authoritative Signer Key Resolution
+  // The requesting workflow or caller cannot substitute or supply an arbitrary issuer key.
+  // Only authoritative WHP keys are trusted. For internal unit test fixtures only,
+  // options._trustedKeyForTesting may provide an isolated key.
   const trustedKeys = [];
-  if (options.issuerKey) {
-    const k = resolveKeyObj(options.issuerKey);
+  if (options._trustedKeyForTesting) {
+    const k = resolveKeyObj(options._trustedKeyForTesting);
     if (k) trustedKeys.push(k);
-  }
-  if (Array.isArray(options.trustedKeys)) {
-    for (const t of options.trustedKeys) {
-      const k = resolveKeyObj(t);
-      if (k) trustedKeys.push(k);
-    }
-  }
-  if (trustedKeys.length === 0) {
-    for (const c of CANONICAL_ISSUER_KEYS) {
+  } else {
+    for (const c of AUTHORITATIVE_ISSUER_KEYS) {
       const k = resolveKeyObj(c);
       if (k) trustedKeys.push(k);
     }
   }
 
   let payload = null;
+  let record = null;
   let outcome = null;
   let markId = null;
   let bounds = null;
@@ -827,19 +827,19 @@ function verify(request, mark, options = {}) {
 
   if (isFormatA) {
     payload = envelope.payload;
-    if (!payload || typeof payload !== 'object') {
-      return { allow: false, reason_code: 'UNREADABLE_MARK', message: 'Malformed payload in sealed Mark' };
+    if (!payload || typeof payload !== "object") {
+      return { allow: false, reason_code: "UNREADABLE_MARK", message: "Malformed payload in sealed Mark" };
     }
 
     const bytes = Buffer.from(canonical({ protected: envelope.protected, payload: envelope.payload }));
     let sigBytes;
     try {
       const sigStr = String(envelope.signature);
-      sigBytes = /^[A-Za-z0-9_-]+$/.test(sigStr) && !sigStr.includes('+') && !sigStr.includes('/')
-        ? Buffer.from(sigStr, 'base64url')
-        : Buffer.from(sigStr, 'base64');
+      sigBytes = /^[A-Za-z0-9_-]+$/.test(sigStr) && !sigStr.includes("+") && !sigStr.includes("/")
+        ? Buffer.from(sigStr, "base64url")
+        : Buffer.from(sigStr, "base64");
     } catch (e) {
-      return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Unable to decode signature bytes' };
+      return { allow: false, reason_code: "INVALID_SIGNATURE", message: "Unable to decode signature bytes" };
     }
 
     for (const keyObj of trustedKeys) {
@@ -854,36 +854,36 @@ function verify(request, mark, options = {}) {
     if (!sigVerified) {
       return {
         allow: false,
-        reason_code: 'INVALID_SIGNATURE',
-        message: 'Signature verification failed against trusted WHP issuer key'
+        reason_code: "INVALID_SIGNATURE",
+        message: "Signature verification failed against authoritative WHP issuer key"
       };
     }
 
     outcome = payload.decision_record?.outcome || payload.outcome;
-    markId = payload.mark_id || payload.decision_record_ref || createHash('sha256').update(bytes).digest('hex');
+    markId = payload.mark_id || payload.decision_record_ref || createHash("sha256").update(bytes).digest("hex");
     bounds = payload.bounds || { valid_from: payload.issued_at, valid_until: payload.expires_at };
     objectBinding = payload.object_binding || payload.decision_record?.object_binding || {};
     proposition = payload.decision_record?.proposition || payload.claim || objectBinding.claim;
   } else if (isFormatB) {
-    const record = envelope.record;
-    if (!record || typeof record !== 'object') {
-      return { allow: false, reason_code: 'UNREADABLE_MARK', message: 'Malformed record in frontdoor Mark' };
+    record = envelope.record;
+    if (!record || typeof record !== "object") {
+      return { allow: false, reason_code: "UNREADABLE_MARK", message: "Malformed record in frontdoor Mark" };
     }
 
     const bytes = Buffer.from(canonical(record));
-    const computedHash = createHash('sha256').update(bytes).digest('hex');
+    const computedHash = createHash("sha256").update(bytes).digest("hex");
 
     if (envelope.record_hash && envelope.record_hash !== computedHash) {
       return {
         allow: false,
-        reason_code: 'TAMPERED_RECORD',
-        message: 'Record hash mismatch: canonical bytes do not match record_hash'
+        reason_code: "TAMPERED_RECORD",
+        message: "Record hash mismatch: canonical bytes do not match record_hash"
       };
     }
 
     const sigObj = envelope.signature;
-    if (!sigObj || typeof sigObj !== 'object') {
-      return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Missing signature object' };
+    if (!sigObj || typeof sigObj !== "object") {
+      return { allow: false, reason_code: "INVALID_SIGNATURE", message: "Missing signature object" };
     }
 
     let sigBytes;
@@ -891,12 +891,12 @@ function verify(request, mark, options = {}) {
       if (sigObj.value_b64url) {
         sigBytes = decodeB64Url(sigObj.value_b64url, 64);
       } else if (sigObj.value_base64 || sigObj.value) {
-        sigBytes = Buffer.from(sigObj.value_base64 || sigObj.value, 'base64');
+        sigBytes = Buffer.from(sigObj.value_base64 || sigObj.value, "base64");
       } else {
-        return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Missing signature value' };
+        return { allow: false, reason_code: "INVALID_SIGNATURE", message: "Missing signature value" };
       }
     } catch (e) {
-      return { allow: false, reason_code: 'INVALID_SIGNATURE', message: 'Invalid signature encoding: ' + e.message };
+      return { allow: false, reason_code: "INVALID_SIGNATURE", message: "Invalid signature encoding: " + e.message };
     }
 
     let signerKeyObj = null;
@@ -907,9 +907,9 @@ function verify(request, mark, options = {}) {
 
     let keyAuthorized = false;
     if (signerKeyObj) {
-      const embeddedRaw = signerKeyObj.export({ format: 'der', type: 'spki' }).subarray(-32);
+      const embeddedRaw = signerKeyObj.export({ format: "der", type: "spki" }).subarray(-32);
       for (const trusted of trustedKeys) {
-        const trustedRaw = trusted.export({ format: 'der', type: 'spki' }).subarray(-32);
+        const trustedRaw = trusted.export({ format: "der", type: "spki" }).subarray(-32);
         if (embeddedRaw.equals(trustedRaw)) {
           keyAuthorized = true;
           break;
@@ -930,8 +930,8 @@ function verify(request, mark, options = {}) {
     if (!keyAuthorized && !sigVerified) {
       return {
         allow: false,
-        reason_code: 'UNAUTHORIZED_KEY',
-        message: 'Signer key is not an authorized WHP issuer key'
+        reason_code: "UNAUTHORIZED_KEY",
+        message: "Signer key is not an authoritative WHP issuer key"
       };
     }
 
@@ -939,8 +939,8 @@ function verify(request, mark, options = {}) {
       if (!cryptoVerify(null, bytes, signerKeyObj, sigBytes)) {
         return {
           allow: false,
-          reason_code: 'INVALID_SIGNATURE',
-          message: 'Ed25519 signature verification failed'
+          reason_code: "INVALID_SIGNATURE",
+          message: "Ed25519 signature verification failed"
         };
       }
       sigVerified = true;
@@ -953,17 +953,17 @@ function verify(request, mark, options = {}) {
     proposition = record.input?.claim || record.input?.proposition || objectBinding.claim;
   }
 
-  // 3. Outcome check: must be ESTABLISHED
-  if (outcome !== 'ESTABLISHED') {
+  // 4. Outcome check: must be ESTABLISHED
+  if (outcome !== "ESTABLISHED") {
     return {
       allow: false,
-      reason_code: 'OUTCOME_NOT_ESTABLISHED',
-      message: `Standing outcome is ${outcome || 'UNSPECIFIED'}; required ESTABLISHED`
+      reason_code: "OUTCOME_NOT_ESTABLISHED",
+      message: `Standing outcome is ${outcome || "UNSPECIFIED"}; required ESTABLISHED`
     };
   }
 
-  // 4. Temporal check: Mark must be current
-  const nowMs = typeof options.now === 'number'
+  // 5. Temporal check: Mark must be current
+  const nowMs = typeof options.now === "number"
     ? options.now
     : (options.now instanceof Date ? options.now.getTime() : Date.now());
   const toleranceMs = (options.clockToleranceSeconds || 60) * 1000;
@@ -974,7 +974,7 @@ function verify(request, mark, options = {}) {
       if (!isNaN(untilMs) && nowMs > (untilMs + toleranceMs)) {
         return {
           allow: false,
-          reason_code: 'MARK_EXPIRED',
+          reason_code: "MARK_EXPIRED",
           message: `Standing Mark expired at ${bounds.valid_until}`
         };
       }
@@ -984,7 +984,7 @@ function verify(request, mark, options = {}) {
       if (!isNaN(fromMs) && nowMs < (fromMs - toleranceMs)) {
         return {
           allow: false,
-          reason_code: 'MARK_NOT_YET_VALID',
+          reason_code: "MARK_NOT_YET_VALID",
           message: `Standing Mark not valid until ${bounds.valid_from}`
         };
       }
@@ -996,101 +996,215 @@ function verify(request, mark, options = {}) {
     if (!isNaN(fromMs) && (nowMs - fromMs) > (options.maxAgeSeconds * 1000 + toleranceMs)) {
       return {
         allow: false,
-        reason_code: 'MARK_EXPIRED',
+        reason_code: "MARK_EXPIRED",
         message: `Standing Mark exceeded maximum allowable age of ${options.maxAgeSeconds}s`
       };
     }
   }
 
-  // 5. Bound object check: Mark must match this exact action
-  const reqOp = (request.operation || request.action || request.requested_operation || '').trim();
+  // 6. Exact Action Binding: Operation, Target, Parameters, Claim, Evidence
+  // Operation check: mandatory on both sides
+  const reqOp = (request.operation || request.action || request.requested_operation || "").trim();
+  if (!reqOp) {
+    return {
+      allow: false,
+      reason_code: "MISSING_OPERATION",
+      message: "Request must specify an operation"
+    };
+  }
+
   const markOp = (
     objectBinding.requested_operation ||
     objectBinding.operation ||
     objectBinding.action ||
-    ''
+    ""
   ).trim();
 
-  if (reqOp && markOp && reqOp.toUpperCase() !== markOp.toUpperCase()) {
+  if (!markOp) {
     return {
       allow: false,
-      reason_code: 'OPERATION_MISMATCH',
+      reason_code: "MISSING_MARK_OPERATION",
+      message: "Mark does not specify a bound operation"
+    };
+  }
+
+  if (reqOp.toUpperCase() !== markOp.toUpperCase()) {
+    return {
+      allow: false,
+      reason_code: "OPERATION_MISMATCH",
       message: `Operation mismatch: request requested ${reqOp}, Mark was bound to ${markOp}`
     };
   }
 
+  // Target check: mandatory on both sides
   const reqTarget = (
     request.target ||
     request.subject ||
     request.object_id ||
     (request.object && (request.object.id || request.object.target)) ||
-    ''
+    ""
   ).toString().trim();
+
+  if (!reqTarget) {
+    return {
+      allow: false,
+      reason_code: "MISSING_TARGET",
+      message: "Request must specify a target object"
+    };
+  }
 
   const markTarget = (
     objectBinding.object_id ||
     objectBinding.subject ||
     objectBinding.target ||
     (objectBinding.object && (objectBinding.object.id || objectBinding.object.target)) ||
-    ''
+    ""
   ).toString().trim();
 
-  if (reqTarget && markTarget && reqTarget !== markTarget) {
+  if (!markTarget) {
     return {
       allow: false,
-      reason_code: 'OBJECT_MISMATCH',
+      reason_code: "MISSING_MARK_TARGET",
+      message: "Mark does not specify a bound target object"
+    };
+  }
+
+  if (reqTarget !== markTarget) {
+    return {
+      allow: false,
+      reason_code: "OBJECT_MISMATCH",
       message: `Object mismatch: request target is ${reqTarget}, Mark is bound to ${markTarget}`
     };
   }
 
+  // Parameters check: exact match when present
+  const reqParams = request.parameters !== undefined ? request.parameters : (request.params !== undefined ? request.params : null);
+  const markParams = objectBinding.parameters !== undefined ? objectBinding.parameters : (objectBinding.params !== undefined ? objectBinding.params : null);
+
+  if (reqParams !== null) {
+    if (markParams === null) {
+      return {
+        allow: false,
+        reason_code: "PARAMETERS_MISMATCH",
+        message: "Request specified parameters, but Mark has no parameter bindings"
+      };
+    }
+    const reqCanonicalParams = canonical(reqParams);
+    const markCanonicalParams = canonical(markParams);
+    if (reqCanonicalParams !== markCanonicalParams) {
+      return {
+        allow: false,
+        reason_code: "PARAMETERS_MISMATCH",
+        message: "Parameter mismatch: request parameters do not match Mark parameters"
+      };
+    }
+  }
+
+  // Claim / proposition check
   const reqClaim = (
     request.claim ||
     request.proposition ||
     request.statement ||
     request.text ||
-    ''
+    ""
   ).toString().trim();
 
   const markClaim = (
     proposition ||
     objectBinding.claim ||
     objectBinding.proposition ||
-    ''
+    ""
   ).toString().trim();
 
   if (reqClaim && markClaim && reqClaim !== markClaim) {
     return {
       allow: false,
-      reason_code: 'PROPOSITION_MISMATCH',
-      message: 'Proposition mismatch: request claim does not match Mark proposition'
+      reason_code: "PROPOSITION_MISMATCH",
+      message: "Proposition mismatch: request claim does not match Mark proposition"
     };
   }
 
-  if ((reqTarget || reqClaim) && !markTarget && !markClaim) {
+  // Evidence and Lawful Unknowns check
+  const unknowns = payload?.lawful_unknowns || record?.lawful_unknowns || [];
+  for (const u of unknowns) {
+    if (u && typeof u === "object") {
+      const standing = (u.standing || u.status || "").toUpperCase();
+      if (standing.includes("BLOCKING") || standing.includes("UNRESOLVED") || standing.includes("PREVENT")) {
+        return {
+          allow: false,
+          reason_code: "UNRESOLVED_LAWFUL_UNKNOWN",
+          message: `Mark contains blocking lawful unknown: ${u.id || u.description || "unresolved"}`
+        };
+      }
+    }
+  }
+
+  const missingEvidence = record?.required_missing || payload?.required_missing || [];
+  if (Array.isArray(missingEvidence) && missingEvidence.length > 0) {
     return {
       allow: false,
-      reason_code: 'UNBOUND_ACTION',
-      message: 'Mark has no object, target, or proposition binding matching the request'
+      reason_code: "REQUIRED_EVIDENCE_MISSING",
+      message: `Mark notes missing required evidence: ${missingEvidence.join(", ")}`
     };
+  }
+
+  // 7. Replay Protection and Single-Use Consumption
+  let consumedSet = null;
+  if (options.consumedMarks instanceof Set) {
+    consumedSet = options.consumedMarks;
+  } else if (Array.isArray(options.consumedMarks)) {
+    consumedSet = new Set(options.consumedMarks);
+  } else if (options.consumedRecordsFile && fs.existsSync(options.consumedRecordsFile)) {
+    try {
+      const content = fs.readFileSync(options.consumedRecordsFile, "utf8").trim();
+      if (content) {
+        const parsed = JSON.parse(content);
+        if (Array.isArray(parsed)) {
+          consumedSet = new Set(parsed.map(x => (typeof x === "string" ? x : x.mark_id || x.id)));
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (consumedSet && consumedSet.has(markId)) {
+    return {
+      allow: false,
+      reason_code: "REPLAY_DETECTED",
+      message: `Replay detected: Mark ${markId} has already been consumed and cannot authorize repeated execution`
+    };
+  }
+
+  // Nonce check if requested
+  const reqNonce = request.nonce !== undefined ? String(request.nonce) : null;
+  const markNonce = objectBinding.nonce !== undefined ? String(objectBinding.nonce) : (payload?.nonce !== undefined ? String(payload.nonce) : null);
+  if (reqNonce !== null) {
+    if (!markNonce || reqNonce !== markNonce) {
+      return {
+        allow: false,
+        reason_code: "NONCE_MISMATCH",
+        message: `Nonce mismatch: request requires nonce ${reqNonce}, Mark has ${markNonce || "none"}`
+      };
+    }
   }
 
   return {
     allow: true,
-    reason_code: 'ALLOW',
-    message: 'Standing Mark verified and bound to requested action',
+    reason_code: "ALLOW",
+    message: "Standing Mark verified and bound to requested action",
     mark_id: markId,
-    outcome: 'ESTABLISHED',
+    outcome: "ESTABLISHED",
     bound_object: {
-      operation: markOp || reqOp || 'INFORM',
-      target: markTarget || reqTarget || null,
-      claim: markClaim || reqClaim || null
+      operation: markOp,
+      target: markTarget,
+      parameters: markParams !== null ? markParams : undefined,
+      claim: markClaim || undefined
     }
   };
 }
 
 function createStandingMiddleware(options = {}) {
   return function standingMiddleware(req, res, next) {
-    const markHeader = req.headers['x-whp-standing-mark'] || req.headers['x-standing-mark'];
+    const markHeader = req.headers["x-whp-standing-mark"] || req.headers["x-standing-mark"];
     let mark = markHeader;
     if (!mark && req.body && req.body._standing_mark) {
       mark = req.body._standing_mark;
@@ -1099,52 +1213,54 @@ function createStandingMiddleware(options = {}) {
     const requestDesc = options.extractRequest ? options.extractRequest(req) : {
       operation: req.method,
       target: req.originalUrl || req.url,
-      claim: req.headers['x-whp-claim'] || (req.body && req.body.claim)
+      parameters: req.body,
+      claim: req.headers["x-whp-claim"] || (req.body && req.body.claim)
     };
 
     const result = verify(requestDesc, mark, options);
 
     if (!result.allow) {
-      if (typeof options.onDeny === 'function') {
+      if (typeof options.onDeny === "function") {
         return options.onDeny(result, req, res, next);
       }
       res.statusCode = 403;
-      res.setHeader('Content-Type', 'application/json');
+      res.setHeader("Content-Type", "application/json");
       return res.end(JSON.stringify({
-        error: 'STANDING_DENIED',
+        error: "STANDING_DENIED",
         reason_code: result.reason_code,
         message: result.message
       }));
     }
 
     req.standing = result;
-    if (typeof next === 'function') next();
+    if (typeof next === "function") next();
   };
 }
 
-function cliVerify(argv = process.argv.slice(3)) {
-  let reqArg = null;
-  let markArg = null;
-  let keyArg = null;
+function cliVerify(argv = process.argv.slice(2)) {
+  let reqArg = process.env.WHP_REQUEST || null;
+  let markArg = process.env.WHP_MARK || null;
+  let consumedFileArg = process.env.WHP_CONSUMED_RECORDS_FILE || null;
 
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--request' || argv[i] === '-r') {
+    if (argv[i] === "--request" || argv[i] === "-r") {
       reqArg = argv[++i];
-    } else if (argv[i] === '--mark' || argv[i] === '-m') {
+    } else if (argv[i] === "--mark" || argv[i] === "-m") {
       markArg = argv[++i];
-    } else if (argv[i] === '--key' || argv[i] === '-k') {
-      keyArg = argv[++i];
+    } else if (argv[i] === "--consumed-records-file" || argv[i] === "-c") {
+      consumedFileArg = argv[++i];
     }
   }
 
   function readInput(val) {
     if (!val) return null;
-    const trimmed = val.trim();
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    const trimmed = typeof val === "string" ? val.trim() : val;
+    if (typeof trimmed !== "string") return trimmed;
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try { return JSON.parse(trimmed); } catch (e) { return null; }
     }
     if (fs.existsSync(trimmed)) {
-      try { return JSON.parse(fs.readFileSync(trimmed, 'utf8')); } catch (e) { return null; }
+      try { return JSON.parse(fs.readFileSync(trimmed, "utf8")); } catch (e) { return null; }
     }
     return trimmed;
   }
@@ -1152,19 +1268,81 @@ function cliVerify(argv = process.argv.slice(3)) {
   const reqObj = readInput(reqArg);
   const markObj = readInput(markArg);
   const options = {};
-  if (keyArg) options.issuerKey = keyArg;
+  if (consumedFileArg) {
+    options.consumedRecordsFile = consumedFileArg;
+  }
 
   const result = verify(reqObj, markObj, options);
   console.log(JSON.stringify(result, null, 2));
-  process.exit(result.allow ? 0 : 1);
+
+  // If allow and consumed records file specified, record consumption
+  let consumed = false;
+  if (result.allow && consumedFileArg) {
+    try {
+      let records = [];
+      if (fs.existsSync(consumedFileArg)) {
+        try {
+          const raw = fs.readFileSync(consumedFileArg, "utf8").trim();
+          if (raw) records = JSON.parse(raw);
+          if (!Array.isArray(records)) records = [];
+        } catch (e) {
+          records = [];
+        }
+      }
+      records.push({
+        mark_id: result.mark_id,
+        operation: result.bound_object?.operation,
+        target: result.bound_object?.target,
+        consumed_at: new Date().toISOString()
+      });
+      fs.writeFileSync(consumedFileArg, JSON.stringify(records, null, 2), "utf8");
+      consumed = true;
+    } catch (e) {
+      console.error("Warning: failed to record mark consumption to file:", e.message);
+    }
+  }
+
+  if (process.env.GITHUB_OUTPUT) {
+    try {
+      fs.appendFileSync(
+        process.env.GITHUB_OUTPUT,
+        `allow=${result.allow}\nreason_code=${result.reason_code}\nmark_id=${result.mark_id || ""}\nconsumed=${consumed}\noutcome=${result.allow ? "ESTABLISHED" : "DENIED"}\n`
+      );
+    } catch (e) {}
+  }
+
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      const summary = [
+        `### WHP Receiving Boundary Verification: \`${result.allow ? "ALLOW" : "DENY"}\``,
+        `- **Determination:** \`${result.allow ? "ALLOWED" : "BLOCKED"}\``,
+        `- **Reason Code:** \`${result.reason_code}\``,
+        `- **Message:** ${result.message}`,
+        result.mark_id ? `- **Mark ID:** \`${result.mark_id}\`` : "",
+        result.bound_object ? `- **Bound Object:** \`${JSON.stringify(result.bound_object)}\`` : "",
+        consumed ? `- **Consumed for Replay Prevention:** \`true\`` : ""
+      ].filter(Boolean).join("\n");
+      fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + "\n");
+    } catch (e) {}
+  }
+
+  if (!result.allow) {
+    console.error(`BLOCKED [RECEIVING_BOUNDARY]: ${result.reason_code} - ${result.message}`);
+    process.exit(1);
+  }
+  process.exit(0);
 }
 
 if (require.main === module) {
-  if (process.argv[2] === 'verify') {
-    cliVerify(process.argv.slice(3));
+  if (
+    process.env.WHP_MODE === "verify" ||
+    process.argv[2] === "verify" ||
+    process.argv.includes("--verify")
+  ) {
+    cliVerify(process.argv.slice(2));
   } else {
     run().catch(err => {
-      console.error('BLOCKED:', err.message);
+      console.error("BLOCKED:", err.message);
       process.exitCode = 1;
     });
   }
@@ -1189,4 +1367,3 @@ module.exports = {
   createStandingMiddleware,
   cliVerify
 };
-

@@ -5,6 +5,22 @@ branding:
   icon: 'shield'
   color: 'blue'
 inputs:
+  mode:
+    description: 'Execution mode: "evaluate" (default, submit examination to service) or "verify" (receiving boundary fail-closed verification of presented Mark)'
+    required: false
+    default: 'evaluate'
+  request:
+    description: 'Action request payload (JSON string or file path) for mode: verify'
+    required: false
+    default: ''
+  mark:
+    description: 'Presented WHP-STANDING-MARK-v1 (JSON string or file path) for mode: verify'
+    required: false
+    default: ''
+  consumed_records_file:
+    description: 'Optional path to a JSON file tracking consumed Mark IDs for single-use replay prevention'
+    required: false
+    default: ''
   api_key:
     description: 'WHP Subscription API Key (Developer, Team, or Institutional tier). Bypasses per-call x402 challenge.'
     required: false
@@ -54,6 +70,18 @@ inputs:
     required: false
     default: ''
 outputs:
+  allow:
+    description: 'Receiving boundary determination: "true" if allowed, "false" if denied'
+    value: ${{ steps.gate.outputs.allow }}
+  reason_code:
+    description: 'Receiving boundary outcome reason code (e.g. ALLOW, INVALID_SIGNATURE, OBJECT_MISMATCH, REPLAY_DETECTED)'
+    value: ${{ steps.gate.outputs.reason_code }}
+  mark_id:
+    description: 'Unique identifier or record hash of the verified Mark'
+    value: ${{ steps.gate.outputs.mark_id }}
+  consumed:
+    description: 'True if single-use Mark was verified and recorded as consumed'
+    value: ${{ steps.gate.outputs.consumed }}
   determination:
     description: 'Evaluation determination outcome'
     value: ${{ steps.gate.outputs.outcome }}
@@ -85,6 +113,10 @@ runs:
     - id: gate
       shell: bash
       env:
+        WHP_MODE: ${{ inputs.mode }}
+        WHP_REQUEST: ${{ inputs.request }}
+        WHP_MARK: ${{ inputs.mark }}
+        WHP_CONSUMED_RECORDS_FILE: ${{ inputs.consumed_records_file }}
         WHP_URL: ${{ inputs.service_url }}
         WHP_DOOR: ${{ inputs.door }}
         WHP_SUBJECT: ${{ inputs.subject }}
@@ -103,7 +135,7 @@ runs:
         WHP_REF: ${{ github.ref }}
         WHP_ACTOR: ${{ github.actor }}
       run: |
-        if [ -n "$WHP_BUYER_KEY" ] || [ -n "$WHP_PAYMENT_KEY" ]; then
+        if [ "$WHP_MODE" != "verify" ] && ([ -n "$WHP_BUYER_KEY" ] || [ -n "$WHP_PAYMENT_KEY" ]); then
           node -e "import('viem/accounts').catch(() => process.exit(1))" 2>/dev/null || npm i --no-save viem@^2.21.0
         fi
         node "${{ github.action_path }}/gate-check.cjs"
