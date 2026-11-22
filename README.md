@@ -40,6 +40,34 @@ jobs:
 
 This example invokes the front door. Add a secret only after WHP has provisioned an API key, or configure an owner-approved x402 wallet/payment client. If neither is configured, a 402 response is expected and the action should fail closed; do not enable mock mode to make a live workflow appear paid or successful.
 
+## Receiving Boundary Verification (Verify Mode)
+
+Standing Gate can be invoked at receiving boundaries to enforce Decision Integrity before executing any consequential action (such as deploy, release, merge, or disbursement):
+
+```yaml
+- name: Verify Standing Mark at Receiving Boundary
+  uses: wheelerhubbell/standing-gate@v0
+  with:
+    mode: verify
+    request: |
+      {
+        "operation": "DEPLOY",
+        "target": "${{ github.repository }}@${{ github.sha }}",
+        "parameters": { "environment": "production" }
+      }
+    mark: ${{ steps.step_name.outputs.mark_json }}
+    consumed_records_file: ".standing-consumed.json" # Replay prevention: enforces single use
+```
+
+In `verify` mode:
+- **Authoritative Key Verification**: The Ed25519 signature is strictly verified against WHP authoritative issuer keys. Caller-supplied keys cannot override authority.
+- **Strict Action Binding**: The Mark must match the exact requested `operation`, `target`, and `parameters`. Mismatches, expired bounds, or unresolved blocking lawful unknowns fail closed.
+- **Mandatory Proposition Binding**: Both the request and the signed Mark must carry the proposition (claim) being bound, and they must match exactly. Missing, malformed, or mismatched propositions reject (`MISSING_CLAIM`, `MALFORMED_CLAIM`, `MISSING_MARK_CLAIM`, `MALFORMED_MARK_CLAIM`, `PROPOSITION_MISMATCH`); a matching operation and target cannot substitute for a missing proposition.
+- **Temporal Validation**: The Mark must carry complete, parseable `valid_from`/`valid_until` bounds. Missing bounds (`MISSING_VALIDITY_BOUNDS`) and unparseable dates (`MALFORMED_VALIDITY`) fail closed; no freshness policy for unbounded Marks is invented client-side. Expired and not-yet-valid Marks reject.
+- **Signed Authorization Respected**: A validly signed Mark containing `authorization: false` is denied (`AUTHORIZATION_DENIED`). A valid signature authenticates what the issuer signed; it never converts an explicit signed denial into permission. An `ALLOW` result is receiver-side acceptance of a bound examination, not issuer authorization for a downstream action.
+- **Replay Prevention**: When `consumed_records_file` is specified, Marks are checked for previous consumption and recorded upon verification, preventing duplicate execution of single-use operations. Consumption is recorded before passage is granted; malformed state, read failures, write failures, and an unestablishable state all deny passage (`REPLAY_STATE_UNAVAILABLE`) rather than warn and pass.
+- **Fail-Closed Execution**: Verification failures exit with code `1`, halting workflow execution immediately before subsequent steps run.
+
 ## Inputs and outputs
 
 The action accepts `structured_input` as a complete JSON object for the live `/v1/evaluate` request. When it is absent, it builds the supported front-door request from `subject`, `claim`, and `provenance`. Optional predecessor fields are carried into the request; their presence alone does not establish authenticated continuity. Treat continuity as established only when the returned, verified evaluator record itself establishes it.

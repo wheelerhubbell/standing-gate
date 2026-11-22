@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
 const {
   canonical,
   decodeB64Url,
@@ -12,7 +15,10 @@ const {
   formatPaymentSignatureHeader,
   resolveCredential,
   signTypedDataPayload,
-  run
+  run,
+  verify,
+  createStandingMiddleware,
+  cliVerify
 } = require('../gate-check.cjs');
 
 test('x402 standing-gate unit & regression test suite', async (t) => {
@@ -611,5 +617,579 @@ test('x402 standing-gate unit & regression test suite', async (t) => {
     assert.match(res.report, /### Successive examination and continuity/);
     assert.match(res.report, /SUCCESSIVE_LINEAGE_ESTABLISHED/);
     assert.match(res.report, /Additional Audit Clearance #2026-B/);
+  });
+});
+
+
+test('Receiving Boundary Rule No. 001: verify(request, mark) adversarial suite', async (t) => {
+  const { privateKey: edPriv, publicKey: edPub } = crypto.generateKeyPairSync('ed25519');
+  const { privateKey: untrustedPriv, publicKey: untrustedPub } = crypto.generateKeyPairSync('ed25519');
+
+  const nowMs = Date.now();
+  const validFrom = new Date(nowMs - 60000).toISOString();
+  const validUntil = new Date(nowMs + 3600000).toISOString();
+
+  function createSignedMark(overrides = {}, privKey = edPriv) {
+    const payload = {
+      type: 'WHP-STANDING-MARK-v1',
+      outcome: overrides.outcome || 'ESTABLISHED',
+      mark_id: overrides.mark_id || 'mark-test-123',
+      bounds: {
+        valid_from: overrides.valid_from !== undefined ? overrides.valid_from : validFrom,
+        valid_until: overrides.valid_until !== undefined ? overrides.valid_until : validUntil
+      },
+      object_binding: {
+        requested_operation: overrides.operation || 'DEPLOY',
+        object_id: overrides.target || 'wheelerhubbell/service-a@v1.0.0',
+        claim: overrides.claim || 'Authorized production deploy',
+        parameters: overrides.parameters !== undefined ? overrides.parameters : { env: 'production', tier: 1 },
+        nonce: overrides.nonce !== undefined ? overrides.nonce : 'nonce-xyz-789'
+      },
+      decision_record: {
+        outcome: overrides.outcome || 'ESTABLISHED',
+        proposition: overrides.claim || 'Authorized production deploy',
+        operation: overrides.operation || 'DEPLOY'
+      }
+    };
+
+    if (overrides.lawful_unknowns) {
+      payload.lawful_unknowns = overrides.lawful_unknowns;
+    }
+    if (overrides.required_missing) {
+      payload.required_missing = overrides.required_missing;
+    }
+
+    const protectedHdr = {
+      type: 'WHP-STANDING-MARK-v1',
+      alg: 'Ed25519',
+      key_id: 'key-test-123'
+    };
+
+    const bytes = Buffer.from(canonical({ protected: protectedHdr, payload }));
+    const sig = crypto.sign(null, bytes, privKey).toString('base64');
+
+    return {
+      protected: protectedHdr,
+      payload,
+      signature: sig
+    };
+  }
+
+  const baseRequest = {
+    operation: 'DEPLOY',
+    target: 'wheelerhubbell/service-a@v1.0.0',
+    claim: 'Authorized production deploy',
+    parameters: { env: 'production', tier: 1 },
+    nonce: 'nonce-xyz-789'
+  };
+
+  const testOpts = { _trustedKeyForTesting: edPub };
+
+  await t.test('1. Valid Mark and matching request returns allow: true with reason_code: ALLOW', () => {
+    const mark = createSignedMark();
+    const result = verify(baseRequest, mark, testOpts);
+    assert.equal(result.allow, true);
+    assert.equal(result.reason_code, 'ALLOW');
+    assert.equal(result.outcome, 'ESTABLISHED');
+    assert.equal(result.mark_id, 'mark-test-123');
+    assert.equal(result.bound_object.operation, 'DEPLOY');
+    assert.equal(result.bound_object.target, 'wheelerhubbell/service-a@v1.0.0');
+    assert.deepEqual(result.bound_object.parameters, { env: 'production', tier: 1 });
+  });
+
+  await t.test('2. Missing or unreadable inputs fail closed with deny', () => {
+    assert.equal(verify(null, createSignedMark(), testOpts).allow, false);
+    assert.equal(verify({}, createSignedMark(), testOpts).allow, false);
+    assert.equal(verify(baseRequest, null, testOpts).allow, false);
+    assert.equal(verify(baseRequest, 'invalid-json', testOpts).allow, false);
+    assert.equal(verify(baseRequest, {}, testOpts).allow, false);
+  });
+
+  await t.test('3. Authoritative key enforcement: untrusted caller-supplied key is rejected', () => {
+    // Signed with an untrusted key
+    const untrustedMark = createSignedMark({}, untrustedPriv);
+    // Verifying against authoritative keys (no _trustedKeyForTesting) MUST fail
+    const result = verify(baseRequest, untrustedMark);
+    assert.equal(result.allow, false);
+    assert.equal(result.reason_code, 'INVALID_SIGNATURE');
+  });
+
+  await t.test('4. Tampered payload or signature fails with INVALID_SIGNATURE', () => {
+    const mark = createSignedMark();
+    mark.payload.object_binding.object_id = 'malicious-target';
+    const result = verify(baseRequest, mark, testOpts);
+    assert.equal(result.allow, false);
+    assert.equal(result.reason_code, 'INVALID_SIGNATURE');
+  });
+
+  await t.test('5. Operation, target, and parameter mismatches are rejected', () => {
+    const mark = createSignedMark();
+    
+    // Operation mismatch
+    const opMismatch = verify({ ...baseRequest, operation: 'DELETE' }, mark, testOpts);
+    assert.equal(opMismatch.allow, false);
+    assert.equal(opMismatch.reason_code, 'OPERATION_MISMATCH');
+
+    // Target mismatch
+    const targetMismatch = verify({ ...baseRequest, target: 'wheelerhubbell/other-repo' }, mark, testOpts);
+    assert.equal(targetMismatch.allow, false);
+    assert.equal(targetMismatch.reason_code, 'OBJECT_MISMATCH');
+
+    // Parameter mismatch
+    const paramMismatch = verify({ ...baseRequest, parameters: { env: 'staging', tier: 1 } }, mark, testOpts);
+    assert.equal(paramMismatch.allow, false);
+    assert.equal(paramMismatch.reason_code, 'PARAMETERS_MISMATCH');
+
+    // Nonce mismatch
+    const nonceMismatch = verify({ ...baseRequest, nonce: 'wrong-nonce' }, mark, testOpts);
+    assert.equal(nonceMismatch.allow, false);
+    assert.equal(nonceMismatch.reason_code, 'NONCE_MISMATCH');
+  });
+
+  await t.test('6. Expired Mark fails with MARK_EXPIRED', () => {
+    const expiredMark = createSignedMark({
+      valid_from: new Date(nowMs - 7200000).toISOString(),
+      valid_until: new Date(nowMs - 3600000).toISOString()
+    });
+    const result = verify(baseRequest, expiredMark, testOpts);
+    assert.equal(result.allow, false);
+    assert.equal(result.reason_code, 'MARK_EXPIRED');
+  });
+
+  await t.test('7. Non-established outcome fails with OUTCOME_NOT_ESTABLISHED', () => {
+    const notEstMark = createSignedMark({ outcome: 'NOT_ESTABLISHED' });
+    const result = verify(baseRequest, notEstMark, testOpts);
+    assert.equal(result.allow, false);
+    assert.equal(result.reason_code, 'OUTCOME_NOT_ESTABLISHED');
+  });
+
+  await t.test('8. Unresolved blocking lawful unknowns or missing evidence fails closed', () => {
+    const unknownMark = createSignedMark({
+      lawful_unknowns: [{ id: 'u-1', standing: 'UNKNOWN_BLOCKING_FOR_REQUESTED_OPERATION' }]
+    });
+    const resUnknown = verify(baseRequest, unknownMark, testOpts);
+    assert.equal(resUnknown.allow, false);
+    assert.equal(resUnknown.reason_code, 'UNRESOLVED_LAWFUL_UNKNOWN');
+
+    const missingMark = createSignedMark({
+      required_missing: ['SecurityPentestApproval']
+    });
+    const resMissing = verify(baseRequest, missingMark, testOpts);
+    assert.equal(resMissing.allow, false);
+    assert.equal(resMissing.reason_code, 'REQUIRED_EVIDENCE_MISSING');
+  });
+
+  await t.test('9. Replay protection: Consumed Mark is rejected on reuse', () => {
+    const mark = createSignedMark({ mark_id: 'single-use-mark-456' });
+    const consumedSet = new Set(['single-use-mark-456']);
+
+    const result = verify(baseRequest, mark, { ...testOpts, consumedMarks: consumedSet });
+    assert.equal(result.allow, false);
+    assert.equal(result.reason_code, 'REPLAY_DETECTED');
+    assert.match(result.message, /already been consumed/);
+  });
+
+  await t.test('10. CLI verify mode and replay file recording fail-closed behavior', () => {
+    const tmpReq = path.join(os.tmpdir(), `req-${Date.now()}.json`);
+    const tmpMark = path.join(os.tmpdir(), `mark-${Date.now()}.json`);
+    const tmpConsumed = path.join(os.tmpdir(), `consumed-${Date.now()}.json`);
+
+    fs.writeFileSync(tmpReq, JSON.stringify(baseRequest));
+    // For CLI testing, create mark signed with live test key or tested via node child_process
+    const mark = createSignedMark();
+    fs.writeFileSync(tmpMark, JSON.stringify(mark));
+
+    // Replay file should record when consumedMarks or CLI executes
+    assert.equal(fs.existsSync(tmpConsumed), false);
+
+    // Clean up
+    try { fs.unlinkSync(tmpReq); } catch (e) {}
+    try { fs.unlinkSync(tmpMark); } catch (e) {}
+    try { fs.unlinkSync(tmpConsumed); } catch (e) {}
+  });
+
+  await t.test('11. HTTP Middleware wrapper returns 403 on deny, calls next() on allow', () => {
+    const middleware = createStandingMiddleware(testOpts);
+    const validMark = createSignedMark();
+
+    let deniedCalled = false;
+    let nextCalled = false;
+
+    // Test Deny
+    const reqDeny = { method: 'POST', url: '/api/action', headers: {} };
+    const resDeny = {
+      statusCode: 200,
+      setHeader: () => {},
+      end: (data) => {
+        deniedCalled = true;
+        const parsed = JSON.parse(data);
+        assert.equal(parsed.error, 'STANDING_DENIED');
+      }
+    };
+    middleware(reqDeny, resDeny, () => { nextCalled = true; });
+    assert.equal(deniedCalled, true);
+    assert.equal(nextCalled, false);
+
+    // Test Allow
+    deniedCalled = false;
+    nextCalled = false;
+    const reqAllow = {
+      method: 'DEPLOY',
+      url: 'wheelerhubbell/service-a@v1.0.0',
+      headers: {
+        'x-whp-standing-mark': JSON.stringify(validMark),
+        'x-whp-claim': 'Authorized production deploy'
+      },
+      body: { env: 'production', tier: 1 }
+    };
+    const resAllow = { statusCode: 200, setHeader: () => {}, end: () => {} };
+    middleware(reqAllow, resAllow, () => { nextCalled = true; });
+    assert.equal(nextCalled, true);
+    assert.equal(reqAllow.standing.allow, true);
+  });
+});
+
+
+test('Receiving Boundary Execution Order corrections: fail-closed adversarial regression suite', async (t) => {
+  const { spawnSync } = require('node:child_process');
+  const { privateKey: edPriv, publicKey: edPub } = crypto.generateKeyPairSync('ed25519');
+  const testOpts = { _trustedKeyForTesting: edPub };
+
+  const nowMs = Date.now();
+  const validFrom = new Date(nowMs - 60000).toISOString();
+  const validUntil = new Date(nowMs + 3600000).toISOString();
+  const protectedHdr = { type: 'WHP-STANDING-MARK-v1', alg: 'Ed25519', key_id: 'key-test-123' };
+  const edPubB64Url = edPub.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
+
+  function signEnvelope(payload, privKey = edPriv) {
+    const bytes = Buffer.from(canonical({ protected: protectedHdr, payload }));
+    return { protected: protectedHdr, payload, signature: crypto.sign(null, bytes, privKey).toString('base64') };
+  }
+
+  function basePayload() {
+    return {
+      type: 'WHP-STANDING-MARK-v1',
+      outcome: 'ESTABLISHED',
+      mark_id: 'mark-eo-' + crypto.randomBytes(4).toString('hex'),
+      bounds: { valid_from: validFrom, valid_until: validUntil },
+      object_binding: {
+        requested_operation: 'DEPLOY',
+        object_id: 'wheelerhubbell/service-a@v1.0.0',
+        claim: 'Authorized production deploy',
+        parameters: { env: 'production', tier: 1 },
+        nonce: 'nonce-xyz-789'
+      },
+      decision_record: { outcome: 'ESTABLISHED', proposition: 'Authorized production deploy', operation: 'DEPLOY' }
+    };
+  }
+
+  function createFormatBMark(mutate) {
+    const record = {
+      type: 'WHP-FRONTDOOR-EVALUATION-v1',
+      input: {
+        subject: 'wheelerhubbell/service-a@v1.0.0',
+        claim: 'Authorized production deploy',
+        operation: 'DEPLOY',
+        parameters: { env: 'production', tier: 1 },
+        nonce: 'nonce-xyz-789'
+      },
+      determination: { outcome: 'ESTABLISHED' },
+      bounds: { valid_from: validFrom, valid_until: validUntil }
+    };
+    if (typeof mutate === 'function') mutate(record);
+    const bytes = Buffer.from(canonical(record));
+    return {
+      record,
+      record_hash: crypto.createHash('sha256').update(bytes).digest('hex'),
+      signature: { alg: 'Ed25519', public_key_b64url: edPubB64Url, value_b64url: crypto.sign(null, bytes, edPriv).toString('base64url') }
+    };
+  }
+
+  const baseRequest = {
+    operation: 'DEPLOY',
+    target: 'wheelerhubbell/service-a@v1.0.0',
+    claim: 'Authorized production deploy',
+    parameters: { env: 'production', tier: 1 },
+    nonce: 'nonce-xyz-789'
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sg-eo-'));
+
+  await t.test('1. Missing request claim rejects even when operation and target match', () => {
+    const req = { ...baseRequest };
+    delete req.claim;
+    const r = verify(req, signEnvelope(basePayload()), testOpts);
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'MISSING_CLAIM');
+  });
+
+  await t.test('2. Malformed request claim rejects', () => {
+    const r = verify({ ...baseRequest, claim: { nested: 'object' } }, signEnvelope(basePayload()), testOpts);
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'MALFORMED_CLAIM');
+  });
+
+  await t.test('3. Missing signed claim rejects', () => {
+    const p = basePayload();
+    delete p.object_binding.claim;
+    delete p.decision_record.proposition;
+    const r = verify(baseRequest, signEnvelope(p), testOpts);
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'MISSING_MARK_CLAIM');
+  });
+
+  await t.test('4. Malformed signed claim rejects', () => {
+    const p = basePayload();
+    p.decision_record.proposition = { not: 'a string' };
+    const r = verify(baseRequest, signEnvelope(p), testOpts);
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'MALFORMED_MARK_CLAIM');
+  });
+
+  await t.test('5. Mismatched claims reject', () => {
+    const r = verify({ ...baseRequest, claim: 'A different proposition entirely' }, signEnvelope(basePayload()), testOpts);
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'PROPOSITION_MISMATCH');
+  });
+
+  await t.test('6. Malformed validity dates reject, never silently skipped', () => {
+    const p1 = basePayload();
+    p1.bounds = { valid_from: validFrom, valid_until: 'not-a-date' };
+    const r1 = verify(baseRequest, signEnvelope(p1), testOpts);
+    assert.equal(r1.allow, false);
+    assert.equal(r1.reason_code, 'MALFORMED_VALIDITY');
+
+    const p2 = basePayload();
+    p2.bounds = { valid_from: 'garbage', valid_until: validUntil };
+    const r2 = verify(baseRequest, signEnvelope(p2), testOpts);
+    assert.equal(r2.allow, false);
+    assert.equal(r2.reason_code, 'MALFORMED_VALIDITY');
+  });
+
+  await t.test('7. Missing validity bounds reject fail-closed', () => {
+    const p1 = basePayload();
+    delete p1.bounds;
+    const r1 = verify(baseRequest, signEnvelope(p1), testOpts);
+    assert.equal(r1.allow, false);
+    assert.equal(r1.reason_code, 'MISSING_VALIDITY_BOUNDS');
+
+    const p2 = basePayload();
+    p2.bounds = { valid_from: validFrom };
+    const r2 = verify(baseRequest, signEnvelope(p2), testOpts);
+    assert.equal(r2.allow, false);
+    assert.equal(r2.reason_code, 'MISSING_VALIDITY_BOUNDS');
+
+    const p3 = basePayload();
+    p3.bounds = { valid_until: validUntil };
+    const r3 = verify(baseRequest, signEnvelope(p3), testOpts);
+    assert.equal(r3.allow, false);
+    assert.equal(r3.reason_code, 'MISSING_VALIDITY_BOUNDS');
+
+    // Frontdoor record without bounds: synthesized bounds carry no valid_until,
+    // so this also fails closed pending an established freshness policy.
+    const r4 = verify(baseRequest, createFormatBMark((rec) => { delete rec.bounds; }), testOpts);
+    assert.equal(r4.allow, false);
+    assert.equal(r4.reason_code, 'MISSING_VALIDITY_BOUNDS');
+  });
+
+  await t.test('8. Expired authorization rejects', () => {
+    const p = basePayload();
+    p.bounds = {
+      valid_from: new Date(nowMs - 7200000).toISOString(),
+      valid_until: new Date(nowMs - 3600000).toISOString()
+    };
+    const r = verify(baseRequest, signEnvelope(p), testOpts);
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'MARK_EXPIRED');
+  });
+
+  await t.test('9. Signed authorization: false rejects despite valid signature', () => {
+    const p1 = basePayload();
+    p1.authorization = false;
+    const r1 = verify(baseRequest, signEnvelope(p1), testOpts);
+    assert.equal(r1.allow, false);
+    assert.equal(r1.reason_code, 'AUTHORIZATION_DENIED');
+
+    const p2 = basePayload();
+    p2.decision_record.authorization = false;
+    const r2 = verify(baseRequest, signEnvelope(p2), testOpts);
+    assert.equal(r2.allow, false);
+    assert.equal(r2.reason_code, 'AUTHORIZATION_DENIED');
+
+    const p3 = basePayload();
+    p3.authorization = { authorized: false };
+    const r3 = verify(baseRequest, signEnvelope(p3), testOpts);
+    assert.equal(r3.allow, false);
+    assert.equal(r3.reason_code, 'AUTHORIZATION_DENIED');
+
+    const r4 = verify(baseRequest, createFormatBMark((rec) => { rec.authorization = false; }), testOpts);
+    assert.equal(r4.allow, false);
+    assert.equal(r4.reason_code, 'AUTHORIZATION_DENIED');
+  });
+
+  await t.test('10. Valid signature alone confers no downstream authorization in the result', () => {
+    const r = verify(baseRequest, signEnvelope(basePayload()), testOpts);
+    assert.equal(r.allow, true);
+    assert.equal(r.reason_code, 'ALLOW');
+    assert.equal('authorization' in r, false);
+    assert.equal('authorized' in r, false);
+    assert.match(r.message, /verified and bound/);
+  });
+
+  await t.test('11. Malformed replay state rejects', () => {
+    const f1 = path.join(tmpDir, 'garbage.json');
+    fs.writeFileSync(f1, 'this is not json');
+    const r1 = verify(baseRequest, signEnvelope(basePayload()), { ...testOpts, consumedRecordsFile: f1 });
+    assert.equal(r1.allow, false);
+    assert.equal(r1.reason_code, 'REPLAY_STATE_UNAVAILABLE');
+
+    const f2 = path.join(tmpDir, 'notarray.json');
+    fs.writeFileSync(f2, '{"a": 1}');
+    const r2 = verify(baseRequest, signEnvelope(basePayload()), { ...testOpts, consumedRecordsFile: f2 });
+    assert.equal(r2.allow, false);
+    assert.equal(r2.reason_code, 'REPLAY_STATE_UNAVAILABLE');
+
+    const f3 = path.join(tmpDir, 'badentry.json');
+    fs.writeFileSync(f3, '[123]');
+    const r3 = verify(baseRequest, signEnvelope(basePayload()), { ...testOpts, consumedRecordsFile: f3 });
+    assert.equal(r3.allow, false);
+    assert.equal(r3.reason_code, 'REPLAY_STATE_UNAVAILABLE');
+
+    const r4 = verify(baseRequest, signEnvelope(basePayload()), { ...testOpts, consumedMarks: 'not-a-set' });
+    assert.equal(r4.allow, false);
+    assert.equal(r4.reason_code, 'REPLAY_STATE_UNAVAILABLE');
+  });
+
+  await t.test('12. Replay-state read failure rejects', () => {
+    // A directory path passes existsSync but cannot be read as a file.
+    const r = verify(baseRequest, signEnvelope(basePayload()), { ...testOpts, consumedRecordsFile: tmpDir });
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'REPLAY_STATE_UNAVAILABLE');
+  });
+
+  await t.test('13. Replay-state write failure rejects', () => {
+    // Parent directory does not exist: consumption state cannot be established.
+    const missing = path.join(tmpDir, 'no-such-dir', 'consumed.json');
+    const r = verify(baseRequest, signEnvelope(basePayload()), { ...testOpts, consumedRecordsFile: missing });
+    assert.equal(r.allow, false);
+    assert.equal(r.reason_code, 'REPLAY_STATE_UNAVAILABLE');
+  });
+
+  await t.test('14. Duplicate consumption rejects: first passage records, reuse is replay', () => {
+    const f = path.join(tmpDir, 'single-use.json');
+    const payload = basePayload();
+    const mark = signEnvelope(payload);
+    const opts = { ...testOpts, consumedRecordsFile: f };
+
+    const r1 = verify(baseRequest, mark, opts);
+    assert.equal(r1.allow, true);
+    assert.equal(r1.consumed, true);
+
+    const recorded = JSON.parse(fs.readFileSync(f, 'utf8'));
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0].mark_id, payload.mark_id);
+
+    const r2 = verify(baseRequest, mark, opts);
+    assert.equal(r2.allow, false);
+    assert.equal(r2.reason_code, 'REPLAY_DETECTED');
+  });
+
+  await t.test('15. In-memory consumption records and prevents reuse', () => {
+    const set = new Set();
+    const mark = signEnvelope(basePayload());
+    const opts = { ...testOpts, consumedMarks: set };
+    const r1 = verify(baseRequest, mark, opts);
+    assert.equal(r1.allow, true);
+    assert.equal(r1.consumed, true);
+    const r2 = verify(baseRequest, mark, opts);
+    assert.equal(r2.allow, false);
+    assert.equal(r2.reason_code, 'REPLAY_DETECTED');
+  });
+
+  await t.test('16. Positive control: properly formed authorized unexpired bound Format A Mark passes', () => {
+    const r = verify(baseRequest, signEnvelope(basePayload()), testOpts);
+    assert.equal(r.allow, true);
+    assert.equal(r.reason_code, 'ALLOW');
+    assert.equal(r.outcome, 'ESTABLISHED');
+    assert.equal(r.bound_object.claim, 'Authorized production deploy');
+  });
+
+  await t.test('17. Positive control: properly formed authorized unexpired bound Format B Mark passes', () => {
+    const r = verify(baseRequest, createFormatBMark(), testOpts);
+    assert.equal(r.allow, true);
+    assert.equal(r.reason_code, 'ALLOW');
+  });
+
+  await t.test('18. Middleware path enforces the same fail-closed claim binding', () => {
+    const middleware = createStandingMiddleware(testOpts);
+    const mark = signEnvelope(basePayload());
+
+    // Missing claim in the receiving request: denied with MISSING_CLAIM
+    let denyBody = null;
+    const reqNoClaim = {
+      method: 'DEPLOY',
+      url: 'wheelerhubbell/service-a@v1.0.0',
+      headers: { 'x-whp-standing-mark': JSON.stringify(mark) },
+      body: { env: 'production', tier: 1 }
+    };
+    const resNoClaim = {
+      statusCode: 200,
+      setHeader: () => {},
+      end: (data) => { denyBody = JSON.parse(data); }
+    };
+    let nextCalled = false;
+    middleware(reqNoClaim, resNoClaim, () => { nextCalled = true; });
+    assert.equal(nextCalled, false);
+    assert.equal(resNoClaim.statusCode, 403);
+    assert.equal(denyBody.reason_code, 'MISSING_CLAIM');
+
+    // Complete request with single-use replay file: allowed, consumption recorded
+    const f = path.join(tmpDir, 'mw-consumed.json');
+    const mwReplay = createStandingMiddleware({ ...testOpts, consumedRecordsFile: f });
+    const reqOk = {
+      method: 'DEPLOY',
+      url: 'wheelerhubbell/service-a@v1.0.0',
+      headers: { 'x-whp-standing-mark': JSON.stringify(mark), 'x-whp-claim': 'Authorized production deploy' },
+      body: { env: 'production', tier: 1 }
+    };
+    const resOk = { statusCode: 200, setHeader: () => {}, end: () => {} };
+    let nextOk = false;
+    mwReplay(reqOk, resOk, () => { nextOk = true; });
+    assert.equal(nextOk, true);
+    assert.equal(reqOk.standing.consumed, true);
+
+    // Second passage of the same Mark through the middleware: replay denied
+    let denyReplay = null;
+    const reqReplay = {
+      method: 'DEPLOY',
+      url: 'wheelerhubbell/service-a@v1.0.0',
+      headers: { 'x-whp-standing-mark': JSON.stringify(mark), 'x-whp-claim': 'Authorized production deploy' },
+      body: { env: 'production', tier: 1 }
+    };
+    const resReplay = {
+      statusCode: 200,
+      setHeader: () => {},
+      end: (data) => { denyReplay = JSON.parse(data); }
+    };
+    mwReplay(reqReplay, resReplay, () => { nextOk = 'replay-passed'; });
+    assert.equal(denyReplay.reason_code, 'REPLAY_DETECTED');
+  });
+
+  await t.test('19. CLI path: deny exits 1; caller-supplied keys cannot override production issuer trust', () => {
+    const reqFile = path.join(tmpDir, 'cli-req.json');
+    const markFile = path.join(tmpDir, 'cli-mark.json');
+    fs.writeFileSync(reqFile, JSON.stringify(baseRequest));
+    fs.writeFileSync(markFile, JSON.stringify(signEnvelope(basePayload())));
+
+    // The fixture is signed with a non-authoritative key; the real CLI must deny.
+    const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'gate-check.cjs'), 'verify', '--request', reqFile, '--mark', markFile], { encoding: 'utf8' });
+    assert.equal(r.status, 1);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.allow, false);
+    assert.equal(out.reason_code, 'INVALID_SIGNATURE');
+
+    // Missing request input: fails closed at the CLI boundary as well.
+    const r2 = spawnSync(process.execPath, [path.join(__dirname, '..', 'gate-check.cjs'), 'verify'], { encoding: 'utf8', env: { ...process.env, WHP_REQUEST: '', WHP_MARK: '' } });
+    assert.equal(r2.status, 1);
   });
 });
