@@ -748,6 +748,19 @@ function resolveKeyObj(rawInput) {
   return null;
 }
 
+// Returns { value } for a present, non-empty string claim, { missing: true }
+// when no candidate field carries anything, or { malformed: true } when a
+// defined candidate is not a usable proposition string. A defined but
+// malformed claim field never falls through to a later candidate.
+function strictClaim(candidates) {
+  for (const c of candidates) {
+    if (c === undefined || c === null) continue;
+    if (typeof c === "string" && c.trim()) return { value: c.trim() };
+    return { malformed: true };
+  }
+  return { missing: true };
+}
+
 function verify(request, mark, options = {}) {
   // 1. Missing, unreadable, or invalid input fails closed
   if (!request || typeof request !== "object" || Array.isArray(request)) {
@@ -962,38 +975,91 @@ function verify(request, mark, options = {}) {
     };
   }
 
-  // 5. Temporal check: Mark must be current
+  // 4b. Signed authorization check.
+  // A valid signature authenticates what the issuer signed; it cannot convert
+  // an explicit signed denial of authorization into permission. An explicit
+  // authorization: false in the signed content denies passage.
+  const signedAuthorization = isFormatA
+    ? (payload.authorization !== undefined ? payload.authorization : payload.decision_record?.authorization)
+    : (record.authorization !== undefined ? record.authorization : record.determination?.authorization);
+  const isExplicitDenial = signedAuthorization === false ||
+    (signedAuthorization !== null && typeof signedAuthorization === "object" &&
+      (signedAuthorization.authorized === false ||
+       signedAuthorization.permitted === false ||
+       signedAuthorization.allow === false));
+  if (isExplicitDenial) {
+    return {
+      allow: false,
+      reason_code: "AUTHORIZATION_DENIED",
+      message: "The signed record explicitly denies authorization (authorization: false); a valid signature authenticates the denial, it does not convert it into permission"
+    };
+  }
+
+  // 5. Temporal validation: the Mark must be current and must carry complete,
+  // parseable validity bounds. Missing or malformed bounds fail closed: the
+  // contract establishes no freshness policy for unbounded or partially
+  // bounded Marks, and none is invented here.
   const nowMs = typeof options.now === "number"
     ? options.now
     : (options.now instanceof Date ? options.now.getTime() : Date.now());
   const toleranceMs = (options.clockToleranceSeconds || 60) * 1000;
 
-  if (bounds) {
-    if (bounds.valid_until) {
-      const untilMs = Date.parse(bounds.valid_until);
-      if (!isNaN(untilMs) && nowMs > (untilMs + toleranceMs)) {
-        return {
-          allow: false,
-          reason_code: "MARK_EXPIRED",
-          message: `Standing Mark expired at ${bounds.valid_until}`
-        };
-      }
-    }
-    if (bounds.valid_from) {
-      const fromMs = Date.parse(bounds.valid_from);
-      if (!isNaN(fromMs) && nowMs < (fromMs - toleranceMs)) {
-        return {
-          allow: false,
-          reason_code: "MARK_NOT_YET_VALID",
-          message: `Standing Mark not valid until ${bounds.valid_from}`
-        };
-      }
-    }
+  if (!bounds || typeof bounds !== "object") {
+    return {
+      allow: false,
+      reason_code: "MISSING_VALIDITY_BOUNDS",
+      message: "Mark carries no validity bounds; the contract establishes no freshness policy for unbounded Marks, so passage is denied"
+    };
+  }
+  if (bounds.valid_from === undefined || bounds.valid_from === null || bounds.valid_from === "") {
+    return {
+      allow: false,
+      reason_code: "MISSING_VALIDITY_BOUNDS",
+      message: "Mark is missing valid_from; the contract establishes no freshness policy for partially bounded Marks, so passage is denied"
+    };
+  }
+  if (bounds.valid_until === undefined || bounds.valid_until === null || bounds.valid_until === "") {
+    return {
+      allow: false,
+      reason_code: "MISSING_VALIDITY_BOUNDS",
+      message: "Mark is missing valid_until; the contract establishes no freshness policy for open-ended Marks, so passage is denied"
+    };
   }
 
-  if (options.maxAgeSeconds && bounds?.valid_from) {
-    const fromMs = Date.parse(bounds.valid_from);
-    if (!isNaN(fromMs) && (nowMs - fromMs) > (options.maxAgeSeconds * 1000 + toleranceMs)) {
+  const fromMs = Date.parse(bounds.valid_from);
+  if (isNaN(fromMs)) {
+    return {
+      allow: false,
+      reason_code: "MALFORMED_VALIDITY",
+      message: `Mark valid_from is not a parseable date: ${String(bounds.valid_from)}`
+    };
+  }
+  const untilMs = Date.parse(bounds.valid_until);
+  if (isNaN(untilMs)) {
+    return {
+      allow: false,
+      reason_code: "MALFORMED_VALIDITY",
+      message: `Mark valid_until is not a parseable date: ${String(bounds.valid_until)}`
+    };
+  }
+
+  if (nowMs > untilMs + toleranceMs) {
+    return {
+      allow: false,
+      reason_code: "MARK_EXPIRED",
+      message: `Standing Mark expired at ${bounds.valid_until}`
+    };
+  }
+  if (nowMs < fromMs - toleranceMs) {
+    return {
+      allow: false,
+      reason_code: "MARK_NOT_YET_VALID",
+      message: `Standing Mark not valid until ${bounds.valid_from}`
+    };
+  }
+
+  if (options.maxAgeSeconds) {
+    if ((nowMs - fromMs) > (options.maxAgeSeconds * 1000 + toleranceMs)) {
       return {
         allow: false,
         reason_code: "MARK_EXPIRED",
@@ -1100,23 +1166,47 @@ function verify(request, mark, options = {}) {
     }
   }
 
-  // Claim / proposition check
-  const reqClaim = (
-    request.claim ||
-    request.proposition ||
-    request.statement ||
-    request.text ||
-    ""
-  ).toString().trim();
+  // Claim / proposition check: mandatory on both sides, exact comparison.
+  // Neither a matching operation nor a matching target can substitute for a
+  // missing proposition. Missing, malformed, or mismatched claims reject.
+  const reqC = strictClaim([request.claim, request.proposition, request.statement, request.text]);
+  if (reqC.missing) {
+    return {
+      allow: false,
+      reason_code: "MISSING_CLAIM",
+      message: "Request must carry the proposition (claim) it asks to have bound; a matching operation and target cannot substitute for it"
+    };
+  }
+  if (reqC.malformed) {
+    return {
+      allow: false,
+      reason_code: "MALFORMED_CLAIM",
+      message: "Request claim is present but is not a non-empty proposition string"
+    };
+  }
 
-  const markClaim = (
-    proposition ||
-    objectBinding.claim ||
-    objectBinding.proposition ||
-    ""
-  ).toString().trim();
+  const markC = strictClaim(isFormatA
+    ? [payload.decision_record?.proposition, payload.claim, objectBinding.claim, objectBinding.proposition]
+    : [record.input?.claim, record.input?.proposition, objectBinding.claim, objectBinding.proposition]);
+  if (markC.missing) {
+    return {
+      allow: false,
+      reason_code: "MISSING_MARK_CLAIM",
+      message: "The signed Mark carries no proposition to bind against the request; a matching operation and target cannot substitute for it"
+    };
+  }
+  if (markC.malformed) {
+    return {
+      allow: false,
+      reason_code: "MALFORMED_MARK_CLAIM",
+      message: "The signed Mark's proposition is present but is not a non-empty proposition string"
+    };
+  }
 
-  if (reqClaim && markClaim && reqClaim !== markClaim) {
+  const reqClaim = reqC.value;
+  const markClaim = markC.value;
+
+  if (reqClaim !== markClaim) {
     return {
       allow: false,
       reason_code: "PROPOSITION_MISMATCH",
@@ -1149,21 +1239,76 @@ function verify(request, mark, options = {}) {
   }
 
   // 7. Replay Protection and Single-Use Consumption
-  let consumedSet = null;
-  if (options.consumedMarks instanceof Set) {
-    consumedSet = options.consumedMarks;
-  } else if (Array.isArray(options.consumedMarks)) {
-    consumedSet = new Set(options.consumedMarks);
-  } else if (options.consumedRecordsFile && fs.existsSync(options.consumedRecordsFile)) {
+  // Where single-use enforcement is configured, any inability to establish,
+  // read, validate, or write consumption state prevents authorization.
+  // There is no warning-followed-by-passage path.
+  const replayStateError = (detail) => ({
+    allow: false,
+    reason_code: "REPLAY_STATE_UNAVAILABLE",
+    message: `Single-use replay protection is configured but consumption state cannot be established: ${detail}`
+  });
+
+  const parseConsumedRecords = (content) => {
+    // Returns the raw consumed-record entries, or throws on malformed state.
+    const trimmed = content.trim();
+    if (!trimmed) return [];
+    let parsed;
     try {
-      const content = fs.readFileSync(options.consumedRecordsFile, "utf8").trim();
-      if (content) {
-        const parsed = JSON.parse(content);
-        if (Array.isArray(parsed)) {
-          consumedSet = new Set(parsed.map(x => (typeof x === "string" ? x : x.mark_id || x.id)));
+      parsed = JSON.parse(trimmed);
+    } catch (e) {
+      throw Error("consumption records file is not valid JSON");
+    }
+    if (!Array.isArray(parsed)) {
+      throw Error("consumption records file does not contain an array");
+    }
+    for (const entry of parsed) {
+      const id = typeof entry === "string" ? entry : (entry && typeof entry === "object" ? (entry.mark_id || entry.id) : undefined);
+      if (typeof id !== "string" || !id) {
+        throw Error("consumption records file contains a malformed entry");
+      }
+    }
+    return parsed;
+  };
+  const consumedIdOf = (entry) => (typeof entry === "string" ? entry : entry.mark_id || entry.id);
+
+  let consumedSet = null;
+  let consumedSource = null;
+  if (options.consumedMarks !== undefined && options.consumedMarks !== null) {
+    if (options.consumedMarks instanceof Set) {
+      consumedSet = options.consumedMarks;
+      consumedSource = "set";
+    } else if (Array.isArray(options.consumedMarks)) {
+      consumedSet = new Set(options.consumedMarks);
+      consumedSource = "array";
+    } else {
+      return replayStateError("consumedMarks must be a Set or an Array of consumed Mark IDs");
+    }
+  }
+
+  if (!consumedSet && options.consumedRecordsFile) {
+    consumedSource = "file";
+    if (!fs.existsSync(options.consumedRecordsFile)) {
+      // First use: establish the consumption state file. Inability to
+      // establish it prevents authorization.
+      try {
+        fs.writeFileSync(options.consumedRecordsFile, "[]\n", { encoding: "utf8", flag: "wx" });
+      } catch (e) {
+        if (e.code !== "EEXIST") {
+          return replayStateError(`cannot create consumption records file (${e.message})`);
         }
       }
-    } catch (e) {}
+    }
+    let content;
+    try {
+      content = fs.readFileSync(options.consumedRecordsFile, "utf8");
+    } catch (e) {
+      return replayStateError(`cannot read consumption records file (${e.message})`);
+    }
+    try {
+      consumedSet = new Set(parseConsumedRecords(content).map(consumedIdOf));
+    } catch (e) {
+      return replayStateError(e.message);
+    }
   }
 
   if (consumedSet && consumedSet.has(markId)) {
@@ -1187,12 +1332,81 @@ function verify(request, mark, options = {}) {
     }
   }
 
+  // Single-use consumption is recorded before passage is granted. If the
+  // consumption record cannot be written, passage is denied.
+  let consumedRecorded = false;
+  if (consumedSet) {
+    if (consumedSource === "file") {
+      const lockDir = options.consumedRecordsFile + ".lock";
+      let locked = false;
+      for (let attempt = 0; attempt < 100 && !locked; attempt++) {
+        try {
+          fs.mkdirSync(lockDir);
+          locked = true;
+        } catch (e) {
+          if (e.code !== "EEXIST") {
+            return replayStateError(`cannot acquire consumption lock (${e.message})`);
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        }
+      }
+      if (!locked) {
+        return replayStateError("consumption records lock held by another process");
+      }
+      try {
+        let lockedContent;
+        try {
+          lockedContent = fs.readFileSync(options.consumedRecordsFile, "utf8");
+        } catch (e) {
+          return replayStateError(`cannot re-read consumption records file (${e.message})`);
+        }
+        let records;
+        try {
+          records = parseConsumedRecords(lockedContent);
+        } catch (e) {
+          return replayStateError(e.message);
+        }
+        if (records.map(consumedIdOf).includes(markId)) {
+          return {
+            allow: false,
+            reason_code: "REPLAY_DETECTED",
+            message: `Replay detected: Mark ${markId} has already been consumed and cannot authorize repeated execution`
+          };
+        }
+        records.push({
+          mark_id: markId,
+          operation: markOp,
+          target: markTarget,
+          consumed_at: new Date().toISOString()
+        });
+        const tmpFile = `${options.consumedRecordsFile}.tmp-${process.pid}`;
+        try {
+          fs.writeFileSync(tmpFile, JSON.stringify(records, null, 2) + "\n", "utf8");
+          fs.renameSync(tmpFile, options.consumedRecordsFile);
+        } catch (e) {
+          try { fs.unlinkSync(tmpFile); } catch (ignored) {}
+          return replayStateError(`cannot write consumption records file (${e.message})`);
+        }
+        consumedRecorded = true;
+      } finally {
+        try { fs.rmdirSync(lockDir); } catch (ignored) {}
+      }
+    } else {
+      consumedSet.add(markId);
+      if (consumedSource === "array") {
+        options.consumedMarks.push(markId);
+      }
+      consumedRecorded = true;
+    }
+  }
+
   return {
     allow: true,
     reason_code: "ALLOW",
     message: "Standing Mark verified and bound to requested action",
     mark_id: markId,
     outcome: "ESTABLISHED",
+    consumed: consumedRecorded,
     bound_object: {
       operation: markOp,
       target: markTarget,
@@ -1275,32 +1489,9 @@ function cliVerify(argv = process.argv.slice(2)) {
   const result = verify(reqObj, markObj, options);
   console.log(JSON.stringify(result, null, 2));
 
-  // If allow and consumed records file specified, record consumption
-  let consumed = false;
-  if (result.allow && consumedFileArg) {
-    try {
-      let records = [];
-      if (fs.existsSync(consumedFileArg)) {
-        try {
-          const raw = fs.readFileSync(consumedFileArg, "utf8").trim();
-          if (raw) records = JSON.parse(raw);
-          if (!Array.isArray(records)) records = [];
-        } catch (e) {
-          records = [];
-        }
-      }
-      records.push({
-        mark_id: result.mark_id,
-        operation: result.bound_object?.operation,
-        target: result.bound_object?.target,
-        consumed_at: new Date().toISOString()
-      });
-      fs.writeFileSync(consumedFileArg, JSON.stringify(records, null, 2), "utf8");
-      consumed = true;
-    } catch (e) {
-      console.error("Warning: failed to record mark consumption to file:", e.message);
-    }
-  }
+  // Single-use consumption is recorded inside verify() before passage is
+  // granted; a failed recording denies passage there. No warning-then-pass.
+  const consumed = result.consumed === true;
 
   if (process.env.GITHUB_OUTPUT) {
     try {
