@@ -6,15 +6,15 @@ branding:
   color: 'blue'
 inputs:
   api_key:
-    description: 'WHP Subscription API Key (Developer, Team, or Institutional tier). Bypasses per-call x402 challenge.'
+    description: 'Retired. The subscription tiers no longer exist and the service does not accept an API key (contract authorization: false). Leave empty; each examination is paid per call with x402.'
     required: false
     default: ''
   service_url:
-    description: 'Standing Witness service base URL'
+    description: 'Standing service base URL. Canonical host per the live contract; the decisionintegrity. host is an alias of the same deployment.'
     required: false
-    default: 'https://decisionintegrity.wheelerhubbellpublishing.com'
+    default: 'https://api.wheelerhubbellpublishing.com'
   door:
-    description: 'Door endpoint to evaluate against (/v1/evaluate, /v1/audit, /v1/ping)'
+    description: 'Door endpoint to evaluate against. /v1/evaluate is the only live door; /v1/audit and /v1/ping are retired.'
     required: false
     default: '/v1/evaluate'
   subject:
